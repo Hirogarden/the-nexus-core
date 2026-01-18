@@ -41,9 +41,19 @@ demo_data_sources/
 *.db
 *.sqlite
 
+# Repository references (for development use only)
+Repos/
+
 # Logs
 *.log
 audit_logs/
+
+# Internal planning documents
+PROJECT_ROADMAP_INTERNAL.md
+REPOS_ANALYSIS_INTERNAL.md
+HARDWARE_OPTIMIZATION_INTERNAL.md
+OVERLOOKED_FEATURES_INTERNAL.md
+*_INTERNAL.md
 
 # OS
 .DS_Store
