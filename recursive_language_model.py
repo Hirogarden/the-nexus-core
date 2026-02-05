@@ -131,10 +131,11 @@ class RecursiveLanguageModel:
         if len(sentences) < 2:
             score -= 0.2
         
-        # Repetition check
+        # Repetition check - minimum unique word ratio for quality content
+        MIN_UNIQUE_WORD_RATIO = 0.6
         words = output.lower().split()
         unique_ratio = len(set(words)) / max(len(words), 1)
-        if unique_ratio < 0.6:
+        if unique_ratio < MIN_UNIQUE_WORD_RATIO:
             score -= 0.2
         
         # Relevance to input (keyword overlap)

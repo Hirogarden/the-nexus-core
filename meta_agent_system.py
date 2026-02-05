@@ -67,6 +67,7 @@ class MetaAgentCoordinator:
         self.agents: Dict[str, Agent] = {}
         self.tasks: Dict[str, AgentTask] = {}
         self.execution_log: List[Dict[str, Any]] = []
+        self._task_counter: int = 0  # Monotonic counter for task IDs
         
         # Register default agents
         self._register_default_agents()
@@ -144,8 +145,9 @@ class MetaAgentCoordinator:
         subtasks = []
         
         # Always start with research
+        self._task_counter += 1
         subtasks.append(AgentTask(
-            task_id=f"task_{len(self.tasks) + 1}",
+            task_id=f"task_{self._task_counter}",
             role=AgentRole.RESEARCHER,
             description=f"Research and gather information for: {main_task}",
             input_data={"main_task": main_task, **context},
@@ -153,8 +155,9 @@ class MetaAgentCoordinator:
         ))
         
         # Then analysis
+        self._task_counter += 1
         subtasks.append(AgentTask(
-            task_id=f"task_{len(self.tasks) + 2}",
+            task_id=f"task_{self._task_counter}",
             role=AgentRole.ANALYZER,
             description=f"Analyze gathered information for: {main_task}",
             input_data={"main_task": main_task},
@@ -163,8 +166,9 @@ class MetaAgentCoordinator:
         ))
         
         # Writing/generation
+        self._task_counter += 1
         subtasks.append(AgentTask(
-            task_id=f"task_{len(self.tasks) + 3}",
+            task_id=f"task_{self._task_counter}",
             role=AgentRole.WRITER,
             description=f"Generate output for: {main_task}",
             input_data={"main_task": main_task},
@@ -173,8 +177,9 @@ class MetaAgentCoordinator:
         ))
         
         # Critical review
+        self._task_counter += 1
         subtasks.append(AgentTask(
-            task_id=f"task_{len(self.tasks) + 4}",
+            task_id=f"task_{self._task_counter}",
             role=AgentRole.CRITIC,
             description=f"Review and validate output for: {main_task}",
             input_data={"main_task": main_task},

@@ -175,8 +175,8 @@ class CharGenSystem:
         
         template_data = self.persona_templates[template]
         
-        # Generate unique ID
-        persona_id = hashlib.md5(
+        # Generate unique ID using secure hash
+        persona_id = hashlib.sha256(
             f"{name}_{datetime.now().isoformat()}".encode()
         ).hexdigest()[:16]
         

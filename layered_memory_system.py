@@ -64,7 +64,7 @@ class ShortTermMemory:
         context: Optional[Dict[str, Any]] = None
     ) -> MemoryItem:
         """Store an item in short-term memory."""
-        memory_id = hashlib.md5(
+        memory_id = hashlib.sha256(
             f"{content}_{datetime.now().isoformat()}".encode()
         ).hexdigest()[:16]
         
@@ -265,13 +265,16 @@ class LongTermMemory:
         current_time = datetime.now()
         max_age = timedelta(days=max_age_days)
         
+        # Days in a year for decay calculation
+        DAYS_PER_YEAR = 365.0
+        
         to_remove = []
         for memory_id, item in self.index.items():
             created_time = datetime.fromisoformat(item.created_at)
             age = current_time - created_time
             
             # Apply decay
-            decayed_importance = item.importance * (1 - item.decay_rate * (age.days / 365))
+            decayed_importance = item.importance * (1 - item.decay_rate * (age.days / DAYS_PER_YEAR))
             
             if decayed_importance < min_importance or age > max_age:
                 to_remove.append(memory_id)

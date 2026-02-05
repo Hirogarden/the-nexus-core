@@ -265,7 +265,9 @@ class LLMRouter:
         selected_model, score = scored_models[0]
         
         # Estimate cost (simplified)
-        estimated_tokens = len(query.split()) * 1.3  # Rough estimate
+        # Token estimation multiplier accounts for response generation overhead
+        TOKEN_ESTIMATION_MULTIPLIER = 1.3
+        estimated_tokens = len(query.split()) * TOKEN_ESTIMATION_MULTIPLIER
         estimated_cost = estimated_tokens * selected_model.cost_per_token
         
         # Create reasoning
@@ -383,9 +385,10 @@ class LLMRouter:
             current_avg = stats["avg_user_rating"]
             total_requests = stats["total_requests"]
             
-            # Update running average
-            new_avg = (current_avg * (total_requests - 1) + user_rating) / total_requests
-            stats["avg_user_rating"] = new_avg
+            # Update running average (guard against division by zero)
+            if total_requests > 0:
+                new_avg = (current_avg * (total_requests - 1) + user_rating) / total_requests
+                stats["avg_user_rating"] = new_avg
     
     def get_model_stats(self, model_id: str) -> Optional[Dict[str, Any]]:
         """Get performance statistics for a model."""
