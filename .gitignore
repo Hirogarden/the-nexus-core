@@ -41,6 +41,7 @@ demo_data_sources/
 demo_brain_ai/
 demo_memory/
 demo_personas/
+example_brain_data/
 *.db
 *.sqlite
 
