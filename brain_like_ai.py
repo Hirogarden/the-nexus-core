@@ -15,6 +15,31 @@ from chargen_system import CharGenSystem, Persona
 from llm_router import LLMRouter, TaskType
 from layered_memory_system import LayeredMemorySystem, MemoryItem
 
+# Config and LLM adapter
+from nexus_core_config import config as _config
+from nexus_core_llm_adapters import llm as _llm
+
+# System prompts for each agent role
+_AGENT_SYSTEM_PROMPTS = {
+    AgentRole.RESEARCHER: (
+        "You are a specialized research agent. Your job is to gather and organize "
+        "all relevant information about the given task. Be thorough, factual, and "
+        "cite key details clearly."
+    ),
+    AgentRole.ANALYZER: (
+        "You are a specialized analysis agent. Analyze the provided information, "
+        "identify patterns, extract key insights, and draw well-reasoned conclusions."
+    ),
+    AgentRole.WRITER: (
+        "You are a specialized writing agent. Generate a clear, well-structured, "
+        "and comprehensive response based on the task description."
+    ),
+    AgentRole.CRITIC: (
+        "You are a specialized critic agent. Review the output critically. "
+        "Identify weaknesses, errors, or gaps and suggest concrete improvements."
+    ),
+}
+
 # Import existing Nexus Core components
 try:
     from nexus_core_engine import NexusCoreEngine
@@ -40,39 +65,57 @@ class BrainLikeAI:
     - Existing RAG components (indexing, search, enhancements)
     """
     
-    def __init__(self, base_path: str = "./nexus_data"):
+    def __init__(self, base_path: str = None):
         """
         Initialize the brain-like AI system.
-        
+
         Args:
-            base_path: Base directory for all data storage
+            base_path: Base directory for all data storage.
+                       Defaults to the path set in config (NEXUS_DATA_PATH).
         """
+        if base_path is None:
+            base_path = _config.nexus_data_path
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
-        
+
         # Initialize all subsystems
         print("🧠 Initializing Brain-Like AI System...")
-        
+
         # Core cognitive components
         self.recursive_model = RecursiveLanguageModel(
-            max_depth=3,
-            reflection_threshold=0.8
+            max_depth=_config.recursive_max_depth,
+            reflection_threshold=_config.recursive_reflection_threshold
         )
         self.reasoning_chain = ReasoningChainBuilder()
-        
+
         # Agent coordination
         self.meta_agents = MetaAgentCoordinator()
-        
+
+        # Wire LLM processors to each agent role
+        for agent in self.meta_agents.agents.values():
+            if agent.role in _AGENT_SYSTEM_PROMPTS:
+                _sys_prompt = _AGENT_SYSTEM_PROMPTS[agent.role]
+                _role_name = agent.role.value
+
+                def _make_processor(sp: str, role: str):
+                    def processor(input_data: dict) -> dict:
+                        task_text = input_data.get("main_task", str(input_data))
+                        response = _llm.complete(task_text, system_prompt=sp)
+                        return {"output": response, "processed": True, "role": role}
+                    return processor
+
+                agent.processor = _make_processor(_sys_prompt, _role_name)
+
         # Persona management
         self.chargen = CharGenSystem(str(self.base_path / "personas"))
-        
+
         # Query routing
         self.router = LLMRouter()
-        
+
         # Memory systems
         self.memory = LayeredMemorySystem(
-            stm_capacity=20,
-            stm_retention_minutes=30,
+            stm_capacity=_config.memory_stm_capacity,
+            stm_retention_minutes=_config.memory_stm_retention_minutes,
             ltm_storage_path=str(self.base_path / "long_term_memory")
         )
         
@@ -252,41 +295,36 @@ class BrainLikeAI:
             "timestamp": datetime.now().isoformat()
         }
     
+    def _build_system_prompt(self) -> str:
+        """Build a system prompt from the active persona (if any)."""
+        if not self.current_persona:
+            return ""
+        p = self.current_persona
+        parts = [f"You are {p.name}, {p.role}."]
+        if p.backstory:
+            parts.append(p.backstory)
+        if p.goals:
+            parts.append(f"Your goals are: {', '.join(p.goals)}.")
+        if p.communication_style:
+            parts.append(f"Communication style: {p.communication_style}.")
+        return " ".join(parts)
+
     def _process_direct(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Direct processing without recursion or agents."""
-        # Simple processing for demonstration
-        output = f"Processing query: {query}"
-        
-        # Add persona influence if available
-        if self.current_persona:
-            output += f"\n\n[Response styled as {self.current_persona.name}, {self.current_persona.role}]"
-        
-        return {
-            "output": output,
-            "metadata": {"method": "direct"}
-        }
-    
+        """Direct processing - single LLM call."""
+        output = _llm.complete(query, system_prompt=self._build_system_prompt(), context=context)
+        return {"output": output, "metadata": {"method": "direct"}}
+
     def _process_recursive(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Process with recursive refinement."""
-        def processor(text: str, ctx: Dict[str, Any]) -> str:
-            # Simulate processing with context
-            depth = ctx.get("depth", 0)
-            if depth == 0:
-                return f"Initial response to: {text}"
-            else:
-                prev = ctx.get("previous_output", "")
-                return f"{prev} [refined at depth {depth}]"
-        
+        """Process with recursive refinement through the LLM."""
         result = self.recursive_model.recursive_process(
             query,
-            processor,
+            _llm.as_processor(system_prompt=self._build_system_prompt()),
             context
         )
-        
-        # Store reasoning chain
+
         chain_id = f"chain_{self.session_id}_{self.interaction_count}"
         self.reasoning_chain.add_chain(chain_id, result["reasoning_chain"])
-        
+
         return {
             "output": result["output"],
             "iterations": result["total_iterations"],
