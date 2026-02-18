@@ -217,7 +217,7 @@ class DataSourceManager:
             }
         
         # Generate unique import ID
-        import_id = hashlib.md5(f"{source_path}{datetime.now().isoformat()}".encode()).hexdigest()[:8]
+        import_id = hashlib.sha256(f"{source_path}{datetime.now().isoformat()}".encode()).hexdigest()[:8]
         import_dir = self.sources_path / import_id
         import_dir.mkdir(parents=True, exist_ok=True)
         

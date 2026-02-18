@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-import hashlib
 
 # Optional dependencies - graceful degradation if not available
 try:

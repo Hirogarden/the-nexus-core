@@ -251,7 +251,7 @@ class DeduplicationEngine:
         
         for result in results:
             content = result.get("text", "")
-            content_hash = hashlib.md5(content.encode()).hexdigest()
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
             
             if content_hash not in seen_hashes:
                 seen_hashes.add(content_hash)
