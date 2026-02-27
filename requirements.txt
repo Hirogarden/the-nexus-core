@@ -1,14 +1,35 @@
 # The Nexus Core - Requirements
-# Optional dependencies for enhanced functionality
+# The system works in basic mode with ZERO dependencies.
+# Install groups below to unlock specific features.
 
-# Vector indexing and semantic search
+# --------------------------
+# API SERVER (required to run nexus_core_api.py)
+# --------------------------
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.9   # required for file uploads
+
+# --------------------------
+# VECTOR INDEXING & SEMANTIC SEARCH (optional)
+# Enables vector-based semantic search and hierarchical indexing.
+# --------------------------
 llama-index>=0.9.0
 
-# Memory management and conversation tracking
+# --------------------------
+# MEMORY MANAGEMENT (optional)
+# Enables advanced conversation memory features.
+# --------------------------
 langchain>=0.1.0
 
-# Note: The Nexus Core works in basic mode with ZERO dependencies.
-# Installing these packages enables enhanced features like:
-# - Vector-based semantic search
-# - Advanced conversation memory
-# - Hierarchical indexing with multiple strategies
+# --------------------------
+# LLM PROVIDERS (install whichever you use)
+# --------------------------
+# openai>=1.0.0       # for LLM_PROVIDER=openai
+# anthropic>=0.25.0   # for LLM_PROVIDER=anthropic
+# Ollama needs no Python package - just install Ollama itself.
+
+# --------------------------
+# CONFIG (optional)
+# Better .env file parsing than the built-in fallback.
+# --------------------------
+# python-dotenv>=1.0.0

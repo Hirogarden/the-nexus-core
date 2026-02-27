@@ -1,0 +1,324 @@
+"""
+The Nexus Core - FastAPI Backend
+
+Exposes the BrainLikeAI system as a REST API.
+
+Run with:
+    uvicorn nexus_core_api:app --reload --host 0.0.0.0 --port 8000
+
+Then open:
+    http://localhost:8000/docs    - Interactive API explorer (Swagger UI)
+    http://localhost:8000/redoc   - Alternative API docs
+
+Requires:
+    pip install fastapi uvicorn
+"""
+
+import shutil
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from nexus_core_config import config
+from brain_like_ai import BrainLikeAI
+
+
+# ---------------------------------------------------------------------------
+# App lifecycle
+# One BrainLikeAI instance shared across all requests within a server run.
+# ---------------------------------------------------------------------------
+
+_brain: Optional[BrainLikeAI] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _brain
+    _brain = BrainLikeAI()
+    yield
+    _brain = None
+
+
+app = FastAPI(
+    title="The Nexus Core API",
+    description=(
+        "Brain-like AI system with RAG, recursive reasoning, "
+        "multi-agent coordination, and layered memory."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _get_brain() -> BrainLikeAI:
+    if _brain is None:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    return _brain
+
+
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+
+class QueryRequest(BaseModel):
+    query: str = Field(..., description="The user's question or instruction")
+    use_recursive: bool = Field(
+        False, description="Use iterative recursive refinement (higher quality, slower)"
+    )
+    use_agents: bool = Field(
+        False, description="Use multi-agent task decomposition (best for complex tasks)"
+    )
+    persona_id: Optional[str] = Field(None, description="Persona ID to use for this query")
+    context: Optional[Dict[str, Any]] = Field(None, description="Optional extra context dict")
+
+
+class PersonaRequest(BaseModel):
+    persona_id: Optional[str] = Field(None, description="ID of an existing persona to activate")
+    template: Optional[str] = Field(
+        None,
+        description="Template for a new persona: expert | companion | analyst | creative | teacher",
+    )
+
+
+class BookmarkRequest(BaseModel):
+    content: str = Field(..., description="Content to save")
+    title: str = Field(..., description="Bookmark title")
+    tags: List[str] = Field(..., description="Tags for categorization")
+    importance: float = Field(0.9, ge=0.0, le=1.0, description="Importance score (0.0-1.0)")
+
+
+# ---------------------------------------------------------------------------
+# System routes
+# ---------------------------------------------------------------------------
+
+@app.get("/health", tags=["System"])
+async def health():
+    """Quick liveness check - always fast, no heavy computation."""
+    return {
+        "status": "ok",
+        "llm_provider": config.llm_provider,
+        "data_path": config.nexus_data_path,
+    }
+
+
+@app.get("/status", tags=["System"])
+async def status():
+    """
+    Full system status including session info, memory stats,
+    routing analytics, and active persona.
+    """
+    brain = _get_brain()
+    return brain.get_system_status()
+
+
+@app.post("/sessions/new", tags=["System"])
+async def new_session():
+    """
+    Reset the system - creates a fresh BrainLikeAI instance with a new
+    session ID and cleared short-term memory. Long-term memory is preserved.
+    """
+    global _brain
+    _brain = BrainLikeAI()
+    return {
+        "session_id": _brain.session_id,
+        "message": "New session started",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Query routes
+# ---------------------------------------------------------------------------
+
+@app.post("/query", tags=["Query"])
+async def query(req: QueryRequest):
+    """
+    Process a query through the brain-like AI system.
+
+    **Processing modes:**
+    - `use_recursive=false, use_agents=false` — Single LLM call. Fastest.
+    - `use_recursive=true` — Iterative refinement loop. Better quality.
+    - `use_agents=true` — Multi-agent decomposition. Best for complex tasks.
+
+    The response includes the output text, routing metadata, processing stats,
+    memory references, and active persona info.
+    """
+    brain = _get_brain()
+    try:
+        result = brain.process_query(
+            query=req.query,
+            context=req.context or {},
+            use_recursive=req.use_recursive,
+            use_agents=req.use_agents,
+            persona_id=req.persona_id,
+        )
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Persona routes
+# ---------------------------------------------------------------------------
+
+@app.get("/personas", tags=["Persona"])
+async def list_personas():
+    """List all available personas."""
+    brain = _get_brain()
+    personas = brain.chargen.list_personas()
+    return {
+        "count": len(personas),
+        "personas": [
+            {
+                "persona_id": p.persona_id,
+                "name": p.name,
+                "role": p.role,
+                "communication_style": p.communication_style,
+                "knowledge_domains": p.knowledge_domains,
+                "active": p.active,
+                "interaction_count": p.interaction_count,
+            }
+            for p in personas
+        ],
+    }
+
+
+@app.post("/persona", tags=["Persona"])
+async def set_persona(req: PersonaRequest):
+    """
+    Activate a persona for subsequent queries.
+
+    - Provide `persona_id` to switch to an existing persona.
+    - Provide `template` to generate and activate a new one.
+    """
+    brain = _get_brain()
+    if not req.persona_id and not req.template:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either persona_id or template (expert | companion | analyst | creative | teacher)",
+        )
+    persona = brain.set_persona(persona_id=req.persona_id, template=req.template)
+    if persona is None:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    return {
+        "persona_id": persona.persona_id,
+        "name": persona.name,
+        "role": persona.role,
+        "message": f"Persona '{persona.name}' is now active",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Memory / Bookmark routes
+# ---------------------------------------------------------------------------
+
+@app.post("/bookmarks", tags=["Memory"])
+async def create_bookmark(req: BookmarkRequest):
+    """
+    Save important information directly to long-term memory as a bookmark.
+    Bookmarks bypass the normal short-term memory consolidation cycle.
+    """
+    brain = _get_brain()
+    try:
+        item = brain.create_bookmark(
+            content=req.content,
+            title=req.title,
+            tags=req.tags,
+            importance=req.importance,
+        )
+        return {
+            "memory_id": item.memory_id,
+            "title": req.title,
+            "tags": item.tags,
+            "importance": item.importance,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/bookmarks", tags=["Memory"])
+async def search_bookmarks(q: Optional[str] = None):
+    """
+    Search bookmarked memories.
+
+    - `GET /bookmarks` — Return all bookmarks.
+    - `GET /bookmarks?q=your+search` — Filter by content similarity.
+    """
+    brain = _get_brain()
+    results = brain.search_bookmarks(query=q)
+    return {
+        "count": len(results),
+        "query": q,
+        "bookmarks": [
+            {
+                "memory_id": m.memory_id,
+                "content": m.content,
+                "importance": m.importance,
+                "tags": m.tags,
+                "created_at": m.created_at,
+            }
+            for m in results
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Document upload route
+# ---------------------------------------------------------------------------
+
+@app.post("/upload", tags=["Documents"])
+async def upload_document(file: UploadFile = File(...)):
+    """
+    Upload a document for ingestion into the knowledge base.
+
+    Files are saved to `nexus_data/uploads/` and staged for processing.
+    Accepted formats: .txt, .md, .pdf, .docx, .csv, .json, and more.
+
+    Note: Full document processing pipeline is in development.
+    Uploaded files are currently staged only.
+    """
+    brain = _get_brain()
+    upload_dir = brain.base_path / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(file.filename).name  # strip any path traversal
+    dest = upload_dir / safe_name
+
+    try:
+        with dest.open("wb") as out:
+            shutil.copyfileobj(file.file, out)
+    finally:
+        await file.close()
+
+    return {
+        "filename": safe_name,
+        "size_bytes": dest.stat().st_size,
+        "saved_to": str(dest),
+        "status": "staged",
+        "message": "File saved. Full processing pipeline coming soon.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Entry point (for running directly: python nexus_core_api.py)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "nexus_core_api:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )
