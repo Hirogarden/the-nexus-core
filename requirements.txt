@@ -22,6 +22,11 @@ llama-index>=0.9.0
 langchain>=0.1.0
 
 # --------------------------
+# UI (required to run nexus_core_ui.py)
+# --------------------------
+streamlit>=1.32.0
+
+# --------------------------
 # LLM PROVIDERS (install whichever you use)
 # --------------------------
 # openai>=1.0.0       # for LLM_PROVIDER=openai
