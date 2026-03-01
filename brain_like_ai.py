@@ -18,6 +18,7 @@ from layered_memory_system import LayeredMemorySystem, MemoryItem
 # Config and LLM adapter
 from nexus_core_config import config as _config
 from nexus_core_llm_adapters import llm as _llm
+from nexus_core_ingestion import search_knowledge_base as _search_kb, get_knowledge_base_stats as _kb_stats
 
 # System prompts for each agent role
 _AGENT_SYSTEM_PROMPTS = {
@@ -191,7 +192,18 @@ class BrainLikeAI:
         if self.query_expander:
             expanded_query, expansion_terms = self.query_expander.expand_query(query)
             context["expansion_terms"] = expansion_terms
-        
+
+        # Step 4.5: Search knowledge base for relevant document chunks
+        try:
+            retrieved_chunks = _search_kb(
+                expanded_query,
+                data_dir=str(self.base_path),
+                top_k=_config.search_top_k,
+            )
+            context["retrieved_chunks"] = retrieved_chunks
+        except Exception:
+            context["retrieved_chunks"] = []
+
         # Step 5: Select or use persona
         if persona_id:
             persona = self.chargen.get_persona(persona_id)
@@ -291,6 +303,16 @@ class BrainLikeAI:
                 "name": self.current_persona.name if self.current_persona else None,
                 "behavior": persona_behavior
             },
+            "sources": [
+                {
+                    "source_file": c["source_file"],
+                    "chunk_index": c["chunk_index"],
+                    "total_chunks": c["total_chunks"],
+                    "score": c.get("score", 0.0),
+                    "text_preview": c["text"][:200] + ("..." if len(c["text"]) > 200 else ""),
+                }
+                for c in context.get("retrieved_chunks", [])
+            ],
             "metadata": response.get("metadata", {}),
             "timestamp": datetime.now().isoformat()
         }
@@ -309,15 +331,39 @@ class BrainLikeAI:
             parts.append(f"Communication style: {p.communication_style}.")
         return " ".join(parts)
 
+    def _build_rag_query(self, query: str, context: Dict[str, Any]) -> str:
+        """
+        Prepend retrieved knowledge base chunks to the query so the LLM
+        can ground its answer in the user's actual documents.
+
+        If no chunks were retrieved, returns the original query unchanged.
+        """
+        chunks = context.get("retrieved_chunks", [])
+        if not chunks:
+            return query
+        parts = []
+        for c in chunks:
+            header = f"[Source: {c['source_file']} | chunk {c['chunk_index'] + 1}/{c['total_chunks']}]"
+            parts.append(f"{header}\n{c['text']}")
+        context_block = "\n\n".join(parts)
+        return (
+            "RELEVANT CONTEXT FROM KNOWLEDGE BASE:\n"
+            f"{context_block}\n\n"
+            "---\n\n"
+            f"QUESTION: {query}"
+        )
+
     def _process_direct(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """Direct processing - single LLM call."""
-        output = _llm.complete(query, system_prompt=self._build_system_prompt(), context=context)
+        augmented_query = self._build_rag_query(query, context)
+        output = _llm.complete(augmented_query, system_prompt=self._build_system_prompt(), context=context)
         return {"output": output, "metadata": {"method": "direct"}}
 
     def _process_recursive(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """Process with recursive refinement through the LLM."""
+        augmented_query = self._build_rag_query(query, context)
         result = self.recursive_model.recursive_process(
-            query,
+            augmented_query,
             _llm.as_processor(system_prompt=self._build_system_prompt()),
             context
         )
@@ -388,7 +434,12 @@ class BrainLikeAI:
         memory_status = self.memory.get_memory_status()
         router_analytics = self.router.get_routing_analytics()
         agent_status = self.meta_agents.get_system_status()
-        
+
+        try:
+            kb_stats = _kb_stats(data_dir=str(self.base_path))
+        except Exception:
+            kb_stats = {"total_chunks": 0, "ingested_files": 0}
+
         return {
             "session_id": self.session_id,
             "interactions": self.interaction_count,
@@ -397,6 +448,7 @@ class BrainLikeAI:
             "routing": router_analytics,
             "agents": agent_status,
             "personas": len(self.chargen.list_personas()),
+            "knowledge_base": kb_stats,
             "timestamp": datetime.now().isoformat()
         }
     

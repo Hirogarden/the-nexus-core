@@ -141,6 +141,19 @@ with tab_chat:
             if ok:
                 output = result.get("output", "")
                 st.markdown(output)
+
+                # Sources from knowledge base
+                sources = result.get("sources", [])
+                if sources:
+                    with st.expander(f"Sources ({len(sources)} chunks)", expanded=False):
+                        for s in sources:
+                            st.markdown(
+                                f"**{s['source_file']}** — chunk {s['chunk_index'] + 1}/{s['total_chunks']} "
+                                f"(score: {s['score']:.2f})"
+                            )
+                            st.caption(s["text_preview"])
+                            st.divider()
+
                 with st.expander("Metadata", expanded=False):
                     cols = st.columns(4)
                     cols[0].metric("Method", result.get("processing", {}).get("method", "-"))
@@ -192,10 +205,16 @@ with tab_upload:
                     files={"file": (f.name, f.getvalue(), f.type or "application/octet-stream")},
                 )
                 if ok:
-                    st.success(
-                        f"**{f.name}** saved to `{data.get('saved_to', '?')}` "
-                        f"({data.get('size_bytes', 0):,} bytes)"
-                    )
+                    ing = data.get("ingestion", {})
+                    status = ing.get("status", "?")
+                    chunks = ing.get("chunks_created", 0)
+                    msg = ing.get("message", "")
+                    if status == "ok":
+                        st.success(f"**{f.name}** — {chunks} chunks ingested. {msg}")
+                    elif status == "skipped":
+                        st.info(f"**{f.name}** — Skipped: {msg}")
+                    else:
+                        st.warning(f"**{f.name}** — {msg}")
                 else:
                     st.error(f"**{f.name}** failed: {data.get('error', 'Upload failed')}")
 
@@ -372,6 +391,15 @@ with tab_status:
         col_a1.metric("Total agents", agents.get("total_agents", 0))
         col_a2.metric("Tasks completed", agents.get("tasks_completed", 0))
         col_a3.metric("Tasks failed", agents.get("tasks_failed", 0))
+
+        st.markdown("---")
+
+        kb = data.get("knowledge_base", {})
+        st.subheader("Knowledge base")
+        col_k1, col_k2, col_k3 = st.columns(3)
+        col_k1.metric("Total chunks", kb.get("total_chunks", 0))
+        col_k2.metric("Ingested files", kb.get("ingested_files", 0))
+        col_k3.metric("Search mode", kb.get("search_mode", "keyword"))
 
         st.markdown("---")
 

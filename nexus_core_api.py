@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from nexus_core_config import config
 from brain_like_ai import BrainLikeAI
+from nexus_core_ingestion import ingest_file, get_knowledge_base_stats
 
 
 # ---------------------------------------------------------------------------
@@ -280,13 +281,13 @@ async def search_bookmarks(q: Optional[str] = None):
 @app.post("/upload", tags=["Documents"])
 async def upload_document(file: UploadFile = File(...)):
     """
-    Upload a document for ingestion into the knowledge base.
+    Upload a document and ingest it into the knowledge base.
 
-    Files are saved to `nexus_data/uploads/` and staged for processing.
-    Accepted formats: .txt, .md, .pdf, .docx, .csv, .json, and more.
+    Files are saved to `nexus_data/uploads/` then immediately chunked and
+    indexed. Accepted formats: .txt, .md, .pdf (requires pdfplumber or
+    PyPDF2), .docx (requires python-docx).
 
-    Note: Full document processing pipeline is in development.
-    Uploaded files are currently staged only.
+    Returns ingestion stats including number of chunks created.
     """
     brain = _get_brain()
     upload_dir = brain.base_path / "uploads"
@@ -301,13 +302,25 @@ async def upload_document(file: UploadFile = File(...)):
     finally:
         await file.close()
 
+    # Ingest into knowledge base
+    ingestion_result = ingest_file(dest, data_dir=str(brain.base_path))
+
     return {
         "filename": safe_name,
         "size_bytes": dest.stat().st_size,
         "saved_to": str(dest),
-        "status": "staged",
-        "message": "File saved. Full processing pipeline coming soon.",
+        "ingestion": ingestion_result,
     }
+
+
+@app.get("/knowledge-base", tags=["Documents"])
+async def knowledge_base_stats():
+    """
+    Return statistics about the current knowledge base:
+    total chunks, ingested files, search mode (keyword vs vector).
+    """
+    brain = _get_brain()
+    return get_knowledge_base_stats(data_dir=str(brain.base_path))
 
 
 # ---------------------------------------------------------------------------
