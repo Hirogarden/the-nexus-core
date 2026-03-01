@@ -468,6 +468,38 @@ async def genome_evolve():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# HiRAG memory routes
+# ---------------------------------------------------------------------------
+
+@app.get("/hirag", tags=["HiRAG"])
+async def hirag_stats():
+    """
+    Return layer-by-layer statistics for the HiRAG hierarchical memory:
+    turn counts, summary counts, topic clusters, identity patterns, and
+    whether any compression pass is pending.
+    """
+    try:
+        return _get_brain().hirag.get_stats()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/hirag/compress", tags=["HiRAG"])
+async def hirag_compress():
+    """
+    Manually trigger all pending HiRAG compression passes:
+      Ephemeral → Daily → Topics → Identity
+
+    Returns the number of new items created at each layer.
+    """
+    try:
+        result = _get_brain().hirag.maybe_compress()
+        return {"status": "ok", "compressed": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(

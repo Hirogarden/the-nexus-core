@@ -672,6 +672,59 @@ with tab_status:
 
         st.markdown("---")
 
+        ok_h, hirag_data = api("get", "/hirag")
+        st.subheader("HiRAG Memory")
+        if ok_h:
+            eph  = hirag_data.get("ephemeral", {})
+            day  = hirag_data.get("daily", {})
+            top  = hirag_data.get("topic", {})
+            iden = hirag_data.get("identity", {})
+            col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+            col_h1.metric(
+                "Ephemeral turns",
+                eph.get("total_turns", 0),
+                help=f"{eph.get('uncompressed_turns', 0)} pending compression",
+            )
+            col_h2.metric(
+                "Daily summaries",
+                day.get("total_summaries", 0),
+                help=f"{day.get('uncompressed_to_topic', 0)} pending → topics",
+            )
+            col_h3.metric(
+                "Topic clusters",
+                top.get("total_clusters", 0),
+                help=f"{top.get('uncompressed_to_identity', 0)} pending → identity",
+            )
+            col_h4.metric("Identity patterns", iden.get("total_patterns", 0))
+
+            pending = hirag_data.get("compression_pending", {})
+            any_pending = any(pending.values())
+            if any_pending:
+                st.caption(
+                    "Compression pending: "
+                    + ", ".join(k for k, v in pending.items() if v)
+                )
+            if st.button(
+                "Compress now",
+                key="hirag_compress",
+                help="Run all pending HiRAG compression passes.",
+            ):
+                ok_c, cv = api("post", "/hirag/compress")
+                if ok_c:
+                    c = cv.get("compressed", {})
+                    st.success(
+                        f"Compressed — daily: {c.get('daily',0)}, "
+                        f"topics: {c.get('topics',0)}, "
+                        f"identity: {c.get('identity',0)}"
+                    )
+                    st.rerun()
+                else:
+                    st.error(cv.get("error", "Compression failed"))
+        else:
+            st.warning("Could not load HiRAG data.")
+
+        st.markdown("---")
+
         st.subheader("Session management")
         if st.button(
             "Start new session",

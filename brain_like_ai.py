@@ -20,6 +20,7 @@ from nexus_core_config import config as _config
 from nexus_core_llm_adapters import llm as _llm
 from nexus_core_ingestion import search_knowledge_base as _search_kb, get_knowledge_base_stats as _kb_stats
 from nexus_core_genome import GenomeStore as _GenomeStore
+from nexus_core_hirag import HiRAGMemory as _HiRAGMemory
 
 # System prompts for each agent role
 _AGENT_SYSTEM_PROMPTS = {
@@ -143,6 +144,12 @@ class BrainLikeAI:
         # NEAT genome store
         self.genome_store = _GenomeStore(data_dir=str(self.base_path))
 
+        # HiRAG hierarchical memory
+        self.hirag = _HiRAGMemory(
+            data_dir=str(self.base_path),
+            summarize_fn=lambda p: _llm.complete(p),
+        )
+
         print("[BrainLikeAI] Brain-Like AI System initialized successfully")
     
     def retrieve_chunks(
@@ -217,7 +224,10 @@ class BrainLikeAI:
 
         # Load the active NEAT genome — genes may override config defaults
         _active_genome = self.genome_store.get_active_genome()
-        
+
+        # Retrieve HiRAG context from all 4 memory layers
+        context["hirag_context"] = self.hirag.retrieve(query, top_k=3)
+
         # Step 1: Route the query to determine optimal processing
         routing_decision = self.router.route_query(query, context)
         
@@ -329,7 +339,12 @@ class BrainLikeAI:
         # Step 9: Perform memory consolidation periodically
         if self.interaction_count % 5 == 0:
             self.memory.consolidate_memories()
-        
+
+        # Step 9b: Ingest turn into HiRAG and trigger compression if needed
+        _output_text = response.get("output", "")
+        self.hirag.ingest_turn(query, _output_text, session_id=self.session_id)
+        self.hirag.maybe_compress()
+
         # Step 10: Compile comprehensive response
         processing_time = (datetime.now() - start_time).total_seconds()
         
@@ -369,6 +384,7 @@ class BrainLikeAI:
             ],
             "metadata": response.get("metadata", {}),
             "genome_id": _active_genome.genome_id,
+            "hirag": self.hirag.get_stats(),
             "timestamp": datetime.now().isoformat()
         }
     
@@ -388,25 +404,37 @@ class BrainLikeAI:
 
     def _build_rag_query(self, query: str, context: Dict[str, Any]) -> str:
         """
-        Prepend retrieved knowledge base chunks to the query so the LLM
-        can ground its answer in the user's actual documents.
-
-        If no chunks were retrieved, returns the original query unchanged.
+        Prepend HiRAG memory context and KB chunks to the query so the LLM
+        can ground its answer in both the user's documents and prior conversation
+        history.  Returns the original query unchanged when both are empty.
         """
+        sections: List[str] = []
+
+        # HiRAG memory context (all 4 layers)
+        hirag_ctx = context.get("hirag_context", [])
+        if hirag_ctx:
+            hirag_lines = "\n".join(f"  {r['content']}" for r in hirag_ctx)
+            sections.append(f"MEMORY CONTEXT:\n{hirag_lines}")
+
+        # Knowledge base chunks
         chunks = context.get("retrieved_chunks", [])
-        if not chunks:
+        if chunks:
+            kb_parts = []
+            for c in chunks:
+                header = (
+                    f"[Source: {c['source_file']} | "
+                    f"chunk {c['chunk_index'] + 1}/{c['total_chunks']}]"
+                )
+                kb_parts.append(f"{header}\n{c['text']}")
+            sections.append(
+                "RELEVANT CONTEXT FROM KNOWLEDGE BASE:\n"
+                + "\n\n".join(kb_parts)
+            )
+
+        if not sections:
             return query
-        parts = []
-        for c in chunks:
-            header = f"[Source: {c['source_file']} | chunk {c['chunk_index'] + 1}/{c['total_chunks']}]"
-            parts.append(f"{header}\n{c['text']}")
-        context_block = "\n\n".join(parts)
-        return (
-            "RELEVANT CONTEXT FROM KNOWLEDGE BASE:\n"
-            f"{context_block}\n\n"
-            "---\n\n"
-            f"QUESTION: {query}"
-        )
+
+        return "\n\n".join(sections) + "\n\n---\n\nQUESTION: " + query
 
     def _process_direct(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """Direct processing - single LLM call."""
@@ -504,6 +532,7 @@ class BrainLikeAI:
             "agents": agent_status,
             "personas": len(self.chargen.list_personas()),
             "knowledge_base": kb_stats,
+            "hirag": self.hirag.get_stats(),
             "timestamp": datetime.now().isoformat()
         }
     
