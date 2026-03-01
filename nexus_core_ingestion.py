@@ -24,15 +24,26 @@ from nexus_core_config import config as _config
 # ---------------------------------------------------------------------------
 # Optional: vector embeddings via sentence-transformers
 # ---------------------------------------------------------------------------
+_EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+_DEVICE = "cpu"
+_VECTOR_SEARCH_AVAILABLE = False
+_EMBEDDING_MODEL = None
+_np = None
+
 try:
-    from sentence_transformers import SentenceTransformer as _ST
+    import torch as _torch
     import numpy as _np
-    _EMBEDDING_MODEL = _ST("all-MiniLM-L6-v2")
+    from sentence_transformers import SentenceTransformer as _ST
+
+    _DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
+    _EMBEDDING_MODEL = _ST(_EMBEDDING_MODEL_NAME, device=_DEVICE)
     _VECTOR_SEARCH_AVAILABLE = True
-except Exception:
-    _EMBEDDING_MODEL = None
-    _np = None
-    _VECTOR_SEARCH_AVAILABLE = False
+    _gpu_name = (
+        _torch.cuda.get_device_name(0) if _DEVICE == "cuda" else "CPU"
+    )
+    print(f"[ingestion] Vector search enabled — model: {_EMBEDDING_MODEL_NAME} | device: {_DEVICE} ({_gpu_name})")
+except Exception as _e:
+    print(f"[ingestion] Vector search unavailable, using keyword fallback ({_e})")
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +299,9 @@ def _vector_score(query: str, chunks: List[Dict[str, Any]]) -> List[float]:
     if not _VECTOR_SEARCH_AVAILABLE or not chunks:
         return [0.0] * len(chunks)
     texts = [c["text"] for c in chunks]
-    q_emb = _EMBEDDING_MODEL.encode([query], normalize_embeddings=True)
-    c_emb = _EMBEDDING_MODEL.encode(texts, normalize_embeddings=True)
+    # batch_size=32 keeps VRAM usage low; normalize gives cosine similarity via dot product
+    q_emb = _EMBEDDING_MODEL.encode([query], normalize_embeddings=True, batch_size=1)
+    c_emb = _EMBEDDING_MODEL.encode(texts, normalize_embeddings=True, batch_size=32)
     scores = (q_emb @ c_emb.T)[0].tolist()
     return scores
 
@@ -483,4 +495,6 @@ def get_knowledge_base_stats(
         "files": ingested,
         "vector_search_available": _VECTOR_SEARCH_AVAILABLE,
         "search_mode": "vector" if _VECTOR_SEARCH_AVAILABLE else "keyword",
+        "embedding_model": _EMBEDDING_MODEL_NAME if _VECTOR_SEARCH_AVAILABLE else None,
+        "embedding_device": _DEVICE if _VECTOR_SEARCH_AVAILABLE else None,
     }

@@ -10,8 +10,19 @@ uvicorn[standard]>=0.23.0
 python-multipart>=0.0.9   # required for file uploads
 
 # --------------------------
-# VECTOR INDEXING & SEMANTIC SEARCH (optional)
-# Enables vector-based semantic search and hierarchical indexing.
+# VECTOR EMBEDDINGS & SEMANTIC SEARCH (required for vector search in ingestion)
+# sentence-transformers runs all-MiniLM-L6-v2 locally (CPU or GPU).
+# Install PyTorch with CUDA 12.8 first for GPU acceleration:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Then:
+#   pip install sentence-transformers
+# Falls back to keyword search automatically if not installed.
+# --------------------------
+sentence-transformers>=2.7.0
+# torch>=2.0.0  # install separately with CUDA build if needed (see above)
+
+# --------------------------
+# VECTOR INDEXING (optional, advanced)
 # --------------------------
 llama-index>=0.9.0
 

@@ -628,10 +628,15 @@ with tab_status:
 
         kb = data.get("knowledge_base", {})
         st.subheader("Knowledge base")
-        col_k1, col_k2, col_k3 = st.columns(3)
+        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
         col_k1.metric("Total chunks", kb.get("total_chunks", 0))
         col_k2.metric("Ingested files", kb.get("ingested_files", 0))
         col_k3.metric("Search mode", kb.get("search_mode", "keyword"))
+        col_k4.metric(
+            "Embedding device",
+            kb.get("embedding_device") or "N/A",
+            help=f"Model: {kb.get('embedding_model') or 'keyword fallback'}",
+        )
 
         st.markdown("---")
 
