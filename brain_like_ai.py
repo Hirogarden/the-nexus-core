@@ -92,7 +92,7 @@ class BrainLikeAI:
         self.reasoning_chain = ReasoningChainBuilder()
 
         # Agent coordination
-        self.meta_agents = MetaAgentCoordinator()
+        self.meta_agents = MetaAgentCoordinator(llm_fn=lambda p: _llm.complete(p))
 
         # Wire LLM processors to each agent role
         for agent in self.meta_agents.agents.values():
@@ -128,7 +128,7 @@ class BrainLikeAI:
             self.indexing = HierarchicalIndexManager(str(self.base_path / "indices"))
             self.citations = CitationManager()
             self.ranker = RelevanceRanker()
-            self.query_expander = QueryExpander()
+            self.query_expander = QueryExpander(llm_fn=lambda p: _llm.complete(p))
         else:
             self.rag_engine = None
             self.indexing = None

@@ -3,10 +3,11 @@ The Nexus Core - MetaGPT-Inspired Meta-Agent System
 Multi-agent coordination and task decomposition framework.
 """
 
+import json
+import re
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 from enum import Enum
-import json
 from dataclasses import dataclass, asdict
 
 
@@ -62,13 +63,14 @@ class MetaAgentCoordinator:
     Coordinates multiple specialized agents for complex tasks.
     """
     
-    def __init__(self):
+    def __init__(self, llm_fn: Optional[Callable[[str], str]] = None):
         """Initialize the meta-agent coordinator."""
+        self._llm_fn = llm_fn
         self.agents: Dict[str, Agent] = {}
         self.tasks: Dict[str, AgentTask] = {}
         self.execution_log: List[Dict[str, Any]] = []
         self._task_counter: int = 0  # Monotonic counter for task IDs
-        
+
         # Register default agents
         self._register_default_agents()
     
@@ -129,32 +131,102 @@ class MetaAgentCoordinator:
     ) -> List[AgentTask]:
         """
         Decompose a complex task into subtasks for different agents.
-        
+
+        Uses the LLM when available to produce task-specific decompositions;
+        falls back to a fixed four-step heuristic (Research → Analyze →
+        Write → Critic) when no LLM function is configured.
+
         Args:
             main_task: High-level task description
             context: Additional context for task decomposition
-        
+
         Returns:
             List of decomposed subtasks
         """
         if context is None:
             context = {}
-        
-        # Simple heuristic-based decomposition
-        # In production, this would use an LLM
-        subtasks = []
-        
-        # Always start with research
+
+        if self._llm_fn is not None:
+            try:
+                return self._decompose_with_llm(main_task, context)
+            except Exception:
+                pass  # fall through to heuristic
+
+        return self._decompose_heuristic(main_task, context)
+
+    # ------------------------------------------------------------------
+    # LLM-backed decomposition
+    # ------------------------------------------------------------------
+
+    _VALID_ROLES = {r.value: r for r in AgentRole}
+
+    def _decompose_with_llm(
+        self, main_task: str, context: Dict[str, Any]
+    ) -> List[AgentTask]:
+        """Ask the LLM to produce a JSON task plan."""
+        roles = ", ".join(r.value for r in AgentRole if r != AgentRole.COORDINATOR)
+        prompt = (
+            "Decompose the following task into 2-5 focused subtasks for a multi-agent system.\n"
+            f"Available roles: {roles}.\n\n"
+            f"Task: {main_task}\n\n"
+            "Return a JSON array only — no other text.  Each item must have:\n"
+            '  "role": one of the available roles (string)\n'
+            '  "description": a specific, concrete task description (string)\n'
+            '  "depends_on": 0-based index of the item this depends on, or null\n\n'
+            "Example:\n"
+            '[{"role":"researcher","description":"gather info","depends_on":null},'
+            '{"role":"writer","description":"write report","depends_on":0}]\n\n'
+            "JSON:"
+        )
+        raw = self._llm_fn(prompt).strip()
+        # Extract the first JSON array from the response
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if not m:
+            raise ValueError("No JSON array in LLM response")
+        items: List[Dict[str, Any]] = json.loads(m.group(0))
+
+        subtasks: List[AgentTask] = []
+        for item in items:
+            role_val = str(item.get("role", "")).lower().strip()
+            role = self._VALID_ROLES.get(role_val, AgentRole.WRITER)
+            dep_index = item.get("depends_on")
+            deps = []
+            if dep_index is not None and 0 <= int(dep_index) < len(subtasks):
+                deps = [subtasks[int(dep_index)].task_id]
+            self._task_counter += 1
+            task = AgentTask(
+                task_id=f"task_{self._task_counter}",
+                role=role,
+                description=str(item.get("description", main_task)),
+                input_data={"main_task": main_task, **context},
+                priority=len(subtasks) + 1,
+                dependencies=deps,
+            )
+            subtasks.append(task)
+            self.tasks[task.task_id] = task
+
+        if not subtasks:
+            raise ValueError("LLM returned empty task list")
+        return subtasks
+
+    # ------------------------------------------------------------------
+    # Heuristic fallback (original behaviour)
+    # ------------------------------------------------------------------
+
+    def _decompose_heuristic(
+        self, main_task: str, context: Dict[str, Any]
+    ) -> List[AgentTask]:
+        """Fixed four-step Research → Analyze → Write → Critic pipeline."""
+        subtasks: List[AgentTask] = []
+
         self._task_counter += 1
         subtasks.append(AgentTask(
             task_id=f"task_{self._task_counter}",
             role=AgentRole.RESEARCHER,
             description=f"Research and gather information for: {main_task}",
             input_data={"main_task": main_task, **context},
-            priority=1
+            priority=1,
         ))
-        
-        # Then analysis
         self._task_counter += 1
         subtasks.append(AgentTask(
             task_id=f"task_{self._task_counter}",
@@ -162,10 +234,8 @@ class MetaAgentCoordinator:
             description=f"Analyze gathered information for: {main_task}",
             input_data={"main_task": main_task},
             priority=2,
-            dependencies=[subtasks[0].task_id]
+            dependencies=[subtasks[0].task_id],
         ))
-        
-        # Writing/generation
         self._task_counter += 1
         subtasks.append(AgentTask(
             task_id=f"task_{self._task_counter}",
@@ -173,10 +243,8 @@ class MetaAgentCoordinator:
             description=f"Generate output for: {main_task}",
             input_data={"main_task": main_task},
             priority=3,
-            dependencies=[subtasks[1].task_id]
+            dependencies=[subtasks[1].task_id],
         ))
-        
-        # Critical review
         self._task_counter += 1
         subtasks.append(AgentTask(
             task_id=f"task_{self._task_counter}",
@@ -184,13 +252,10 @@ class MetaAgentCoordinator:
             description=f"Review and validate output for: {main_task}",
             input_data={"main_task": main_task},
             priority=4,
-            dependencies=[subtasks[2].task_id]
+            dependencies=[subtasks[2].task_id],
         ))
-        
-        # Store tasks
         for task in subtasks:
             self.tasks[task.task_id] = task
-        
         return subtasks
     
     def assign_task(self, task: AgentTask) -> Optional[Agent]:

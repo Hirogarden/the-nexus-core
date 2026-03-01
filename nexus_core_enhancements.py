@@ -3,7 +3,7 @@ The Nexus Core - Advanced Enhancement Features
 Addresses 7 common RAG system complaints with production-ready solutions.
 """
 
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Callable, Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime
 import hashlib
 import re
@@ -636,10 +636,15 @@ class QueryExpander:
     """
     Feature 7: Query Expansion
     Expand queries with synonyms and related terms.
+
+    When llm_fn is provided, expansion is performed by the LLM which produces
+    richer related terms tailored to the actual query.  Falls back to the
+    built-in synonym map when llm_fn is None or when the LLM call fails.
     """
-    
-    def __init__(self):
-        # Domain-specific synonym map
+
+    def __init__(self, llm_fn: Optional[Callable[[str], str]] = None):
+        self._llm_fn = llm_fn
+        # Domain-specific synonym map (heuristic fallback)
         self.synonym_map = {
             "doctor": ["physician", "medical professional", "clinician"],
             "patient": ["individual", "person", "client"],
@@ -651,7 +656,7 @@ class QueryExpander:
             "happy": ["joyful", "pleased", "content", "glad"],
             "sad": ["unhappy", "depressed", "down", "melancholy"]
         }
-    
+
     def expand_query(
         self,
         query: str,
@@ -659,34 +664,64 @@ class QueryExpander:
     ) -> Tuple[str, List[str]]:
         """
         Expand query with synonyms and related terms.
-        
+
+        Uses the LLM when available; falls back to the synonym map.
+
         Returns:
             (expanded_query, expansion_terms)
         """
+        if self._llm_fn is not None:
+            try:
+                return self._expand_with_llm(query, max_expansions)
+            except Exception:
+                pass  # fall through to heuristic
+
+        return self._expand_heuristic(query, max_expansions)
+
+    # ------------------------------------------------------------------
+    # LLM-backed expansion
+    # ------------------------------------------------------------------
+
+    def _expand_with_llm(self, query: str, max_expansions: int) -> Tuple[str, List[str]]:
+        """Ask the LLM for related search terms."""
+        prompt = (
+            f"Generate {max_expansions} concise search terms related to the following query.\n"
+            "Return ONLY the terms, one per line, with no explanations or numbering.\n\n"
+            f"Query: {query}\n\nRelated search terms:"
+        )
+        raw = self._llm_fn(prompt).strip()
+        terms = [
+            line.strip().lstrip("-•*").strip()
+            for line in raw.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ][:max_expansions]
+        if not terms:
+            return query, []
+        expanded = query + " " + " ".join(terms)
+        return expanded, terms
+
+    # ------------------------------------------------------------------
+    # Heuristic fallback (original behaviour)
+    # ------------------------------------------------------------------
+
+    def _expand_heuristic(self, query: str, max_expansions: int) -> Tuple[str, List[str]]:
         words = query.lower().split()
         expansions = []
-        
         for word in words:
             if word in self.synonym_map:
-                # Add top N synonyms
-                synonyms = self.synonym_map[word][:max_expansions]
-                expansions.extend(synonyms)
-        
-        # Create expanded query
+                expansions.extend(self.synonym_map[word][:max_expansions])
         if expansions:
             expanded = query + " " + " ".join(expansions)
         else:
             expanded = query
-        
         return expanded, expansions
-    
+
     def add_synonyms(self, term: str, synonyms: List[str]):
-        """Add custom synonyms to the map."""
+        """Add custom synonyms to the fallback map."""
         if term.lower() not in self.synonym_map:
             self.synonym_map[term.lower()] = []
-        
         self.synonym_map[term.lower()].extend(synonyms)
-    
+
     def get_expanded_terms(self, query: str) -> List[str]:
         """Get all expanded terms for a query."""
         _, expansions = self.expand_query(query)
