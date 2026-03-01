@@ -168,28 +168,57 @@ with tab_chat:
             f"Query: *{st.session_state.gate_query}* | Task type: `{st.session_state.gate_task_type}`"
         )
         chunks = st.session_state.gate_chunks
+        included_chunks = []
         if not chunks:
             st.info(
                 "No matching chunks found in the knowledge base. "
                 "The response will draw on general knowledge only."
             )
         else:
+            st.caption(
+                "Uncheck any chunks you want to exclude before synthesizing. "
+                "Unchecked chunks will not be sent to the LLM."
+            )
             for i, c in enumerate(chunks):
                 with st.expander(
                     f"Chunk {i + 1}: **{c['source_file']}** — "
                     f"{c['chunk_index'] + 1}/{c['total_chunks']} (score: {c['score']:.2f})",
                     expanded=(i == 0),
                 ):
+                    include = st.checkbox(
+                        "Include in synthesis",
+                        value=True,
+                        key=f"gate_chunk_include_{i}",
+                    )
                     st.markdown(c["text"])
+                if include:
+                    included_chunks.append(c)
 
+            n_in = len(included_chunks)
+            n_total = len(chunks)
+            if n_in == 0:
+                st.warning(
+                    "All chunks are deselected. The LLM will answer from general "
+                    "knowledge only — no document context will be used."
+                )
+            else:
+                st.caption(f"{n_in} of {n_total} chunk(s) selected for synthesis.")
+
+        n_in = len(included_chunks)
+        n_total = len(chunks) if chunks else 0
+        btn_label = (
+            f"Synthesize with {n_in}/{n_total} chunk(s)"
+            if n_total > 0
+            else "Synthesize (no KB context)"
+        )
         st.markdown("")
         col_approve, col_discard = st.columns(2)
         with col_approve:
-            if st.button("Approve & Synthesize", type="primary", use_container_width=True):
+            if st.button(btn_label, type="primary", use_container_width=True):
                 with st.spinner("Synthesizing response..."):
                     ok2, result = api("post", "/synthesize", json={
                         "query": st.session_state.gate_query,
-                        "approved_chunks": st.session_state.gate_chunks,
+                        "approved_chunks": included_chunks,
                         "use_recursive": st.session_state.gate_use_recursive,
                         "use_agents": st.session_state.gate_use_agents,
                         "persona_id": st.session_state.gate_persona_id,
