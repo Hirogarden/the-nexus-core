@@ -14,8 +14,10 @@ Requires:
     pip install fastapi uvicorn
 """
 
+import json
 import shutil
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -100,6 +102,31 @@ class BookmarkRequest(BaseModel):
     importance: float = Field(0.9, ge=0.0, le=1.0, description="Importance score (0.0-1.0)")
 
 
+class RetrieveRequest(BaseModel):
+    query: str = Field(..., description="Query to retrieve chunks for")
+    context: Optional[Dict[str, Any]] = Field(None, description="Optional extra context")
+
+
+class SynthesizeRequest(BaseModel):
+    query: str = Field(..., description="Original user query")
+    approved_chunks: List[Dict[str, Any]] = Field(
+        ..., description="Chunks approved by the user in Gate 1"
+    )
+    use_recursive: bool = Field(False)
+    use_agents: bool = Field(False)
+    persona_id: Optional[str] = Field(None)
+    context: Optional[Dict[str, Any]] = Field(None)
+
+
+class FeedbackRequest(BaseModel):
+    query: str = Field(..., description="The original query")
+    response: str = Field(..., description="The response that was rated")
+    rating: int = Field(..., ge=-1, le=1, description="1=thumbs up, -1=thumbs down, 0=neutral")
+    sources: List[str] = Field(default_factory=list, description="Source files used")
+    processing_method: Optional[str] = Field(None)
+    session_id: Optional[str] = Field(None)
+
+
 # ---------------------------------------------------------------------------
 # System routes
 # ---------------------------------------------------------------------------
@@ -165,6 +192,70 @@ async def query(req: QueryRequest):
             persona_id=req.persona_id,
         )
         return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _log_fitness(data: dict) -> None:
+    """Append a fitness record to nexus_data/fitness/fitness_log.jsonl."""
+    brain = _get_brain()
+    fitness_dir = brain.base_path / "fitness"
+    fitness_dir.mkdir(parents=True, exist_ok=True)
+    record = {"timestamp": datetime.now().isoformat(), **data}
+    with open(fitness_dir / "fitness_log.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+@app.post("/retrieve", tags=["Query"])
+async def retrieve(req: RetrieveRequest):
+    """
+    Gate 1 — retrieve KB chunks for a query without calling the LLM.
+    Returns candidate chunks for user review and approval before synthesis.
+    """
+    brain = _get_brain()
+    try:
+        return brain.retrieve_chunks(query=req.query, context=req.context or {})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/synthesize", tags=["Query"])
+async def synthesize(req: SynthesizeRequest):
+    """
+    Gate 2 — synthesize a response using the user-approved chunks from Gate 1.
+    Bypasses KB search and uses exactly the chunks provided.
+    """
+    brain = _get_brain()
+    try:
+        return brain.process_query(
+            query=req.query,
+            context=req.context or {},
+            use_recursive=req.use_recursive,
+            use_agents=req.use_agents,
+            persona_id=req.persona_id,
+            _preloaded_chunks=req.approved_chunks,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/feedback", tags=["Query"])
+async def feedback(req: FeedbackRequest):
+    """
+    Gate 3 fitness signal — record a user rating (thumbs up/down) for a response.
+    Written to nexus_data/fitness/fitness_log.jsonl for use by NEAT evolution.
+    """
+    try:
+        brain = _get_brain()
+        _log_fitness({
+            "query": req.query,
+            "response_preview": req.response[:300],
+            "rating": req.rating,
+            "sources": req.sources,
+            "processing_method": req.processing_method,
+            "session_id": req.session_id or brain.session_id,
+        })
+        return {"status": "ok", "rating": req.rating}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

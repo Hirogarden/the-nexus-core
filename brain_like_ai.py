@@ -141,13 +141,56 @@ class BrainLikeAI:
         
         print("[BrainLikeAI] Brain-Like AI System initialized successfully")
     
+    def retrieve_chunks(
+        self,
+        query: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Gate 1 — retrieve KB chunks for a query without calling the LLM.
+        Returns candidate chunks so the user can approve/reject before synthesis.
+        """
+        if context is None:
+            context = {}
+        routing_decision = self.router.route_query(query, context)
+        expanded_query = query
+        if self.query_expander:
+            expanded_query, _ = self.query_expander.expand_query(query)
+        try:
+            chunks = _search_kb(
+                expanded_query,
+                data_dir=str(self.base_path),
+                top_k=_config.search_top_k,
+            )
+        except Exception:
+            chunks = []
+        return {
+            "query": query,
+            "expanded_query": expanded_query,
+            "task_type": routing_decision.detected_task_type.value,
+            "chunks": [
+                {
+                    "chunk_id": c.get("chunk_id", ""),
+                    "source_file": c["source_file"],
+                    "source_path": c.get("source_path", ""),
+                    "chunk_index": c["chunk_index"],
+                    "total_chunks": c["total_chunks"],
+                    "score": c.get("score", 0.0),
+                    "text": c["text"],
+                    "text_preview": c["text"][:200] + ("..." if len(c["text"]) > 200 else ""),
+                }
+                for c in chunks
+            ],
+        }
+
     def process_query(
         self,
         query: str,
         context: Optional[Dict[str, Any]] = None,
         use_recursive: bool = True,
         use_agents: bool = False,
-        persona_id: Optional[str] = None
+        persona_id: Optional[str] = None,
+        _preloaded_chunks: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Process a query through the brain-like system.
@@ -194,15 +237,19 @@ class BrainLikeAI:
             context["expansion_terms"] = expansion_terms
 
         # Step 4.5: Search knowledge base for relevant document chunks
-        try:
-            retrieved_chunks = _search_kb(
-                expanded_query,
-                data_dir=str(self.base_path),
-                top_k=_config.search_top_k,
-            )
-            context["retrieved_chunks"] = retrieved_chunks
-        except Exception:
-            context["retrieved_chunks"] = []
+        if _preloaded_chunks is not None:
+            # User-approved chunks from Gate 1 — skip KB search
+            context["retrieved_chunks"] = _preloaded_chunks
+        else:
+            try:
+                retrieved_chunks = _search_kb(
+                    expanded_query,
+                    data_dir=str(self.base_path),
+                    top_k=_config.search_top_k,
+                )
+                context["retrieved_chunks"] = retrieved_chunks
+            except Exception:
+                context["retrieved_chunks"] = []
 
         # Step 5: Select or use persona
         if persona_id:

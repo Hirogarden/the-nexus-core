@@ -50,6 +50,16 @@ with st.sidebar:
         st.warning(f"Connection issue: {exc}")
 
     st.markdown("---")
+    gate_mode = st.toggle(
+        "3-Stage Gate Mode",
+        value=False,
+        help=(
+            "Gate 1: review retrieved chunks before synthesis. "
+            "Gate 2: review draft before acceptance. "
+            "Gate 3: rate the response (fitness signal for NEAT)."
+        ),
+    )
+    st.markdown("---")
     st.caption("Tabs: Chat - Upload - Personas - Bookmarks - Status")
 
 
@@ -108,12 +118,39 @@ with tab_chat:
 
     st.markdown("---")
 
+    # ---- Session state initialisation ----------------------------------------
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    for key, default in [
+        ("gate_stage", "idle"),
+        ("gate_query", ""),
+        ("gate_chunks", []),
+        ("gate_task_type", ""),
+        ("gate_use_recursive", False),
+        ("gate_use_agents", False),
+        ("gate_persona_id", None),
+        ("gate_response", {}),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
+    # If gate mode is turned OFF mid-session, reset any in-flight gate
+    if not gate_mode and st.session_state.gate_stage != "idle":
+        st.session_state.gate_stage = "idle"
+
+    # ---- Message history -------------------------------------------------------
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("sources"):
+                with st.expander(f"Sources ({len(msg['sources'])} chunks)", expanded=False):
+                    for s in msg["sources"]:
+                        st.markdown(
+                            f"**{s['source_file']}** — chunk {s['chunk_index'] + 1}/{s['total_chunks']} "
+                            f"(score: {s['score']:.2f})"
+                        )
+                        st.caption(s["text_preview"])
+                        st.divider()
             if "meta" in msg:
                 with st.expander("Metadata", expanded=False):
                     m = msg["meta"]
@@ -123,54 +160,220 @@ with tab_chat:
                     cols[2].metric("Task type", m.get("routing", {}).get("task_type", "-"))
                     cols[3].metric("Memories used", m.get("memory", {}).get("relevant_memories", 0))
 
-    query = st.chat_input("Ask anything...")
-    if query:
-        st.session_state.messages.append({"role": "user", "content": query})
-        with st.chat_message("user"):
-            st.markdown(query)
+    # ---- Gate 1: Review Retrieved Chunks ---------------------------------------
+    if st.session_state.gate_stage == "gate1":
+        st.divider()
+        st.subheader("Gate 1 — Review Retrieved Chunks")
+        st.caption(
+            f"Query: *{st.session_state.gate_query}* | Task type: `{st.session_state.gate_task_type}`"
+        )
+        chunks = st.session_state.gate_chunks
+        if not chunks:
+            st.info(
+                "No matching chunks found in the knowledge base. "
+                "The response will draw on general knowledge only."
+            )
+        else:
+            for i, c in enumerate(chunks):
+                with st.expander(
+                    f"Chunk {i + 1}: **{c['source_file']}** — "
+                    f"{c['chunk_index'] + 1}/{c['total_chunks']} (score: {c['score']:.2f})",
+                    expanded=(i == 0),
+                ):
+                    st.markdown(c["text"])
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                ok, result = api("post", "/query", json={
-                    "query": query,
-                    "use_recursive": use_recursive,
-                    "use_agents": use_agents,
-                    "persona_id": selected_persona_id,
-                })
+        st.markdown("")
+        col_approve, col_discard = st.columns(2)
+        with col_approve:
+            if st.button("Approve & Synthesize", type="primary", use_container_width=True):
+                with st.spinner("Synthesizing response..."):
+                    ok2, result = api("post", "/synthesize", json={
+                        "query": st.session_state.gate_query,
+                        "approved_chunks": st.session_state.gate_chunks,
+                        "use_recursive": st.session_state.gate_use_recursive,
+                        "use_agents": st.session_state.gate_use_agents,
+                        "persona_id": st.session_state.gate_persona_id,
+                    })
+                if ok2:
+                    st.session_state.gate_response = result
+                    st.session_state.gate_stage = "gate2"
+                    st.rerun()
+                else:
+                    st.error(result.get("error", "Synthesis failed"))
+        with col_discard:
+            if st.button("Discard & Start Over", use_container_width=True):
+                st.session_state.gate_stage = "idle"
+                st.rerun()
 
-            if ok:
-                output = result.get("output", "")
-                st.markdown(output)
+    # ---- Gate 2: Review Draft Response -----------------------------------------
+    elif st.session_state.gate_stage == "gate2":
+        st.divider()
+        st.subheader("Gate 2 — Review Draft Response")
+        draft = st.session_state.gate_response
+        draft_text = draft.get("output", "")
 
-                # Sources from knowledge base
-                sources = result.get("sources", [])
-                if sources:
-                    with st.expander(f"Sources ({len(sources)} chunks)", expanded=False):
-                        for s in sources:
-                            st.markdown(
-                                f"**{s['source_file']}** — chunk {s['chunk_index'] + 1}/{s['total_chunks']} "
-                                f"(score: {s['score']:.2f})"
-                            )
-                            st.caption(s["text_preview"])
-                            st.divider()
+        with st.container(border=True):
+            st.markdown(draft_text)
+            sources = draft.get("sources", [])
+            if sources:
+                with st.expander(f"Sources used ({len(sources)} chunks)", expanded=False):
+                    for s in sources:
+                        st.markdown(
+                            f"**{s['source_file']}** — chunk {s['chunk_index'] + 1}/{s['total_chunks']} "
+                            f"(score: {s['score']:.2f})"
+                        )
+                        st.caption(s["text_preview"])
+                        st.divider()
 
-                with st.expander("Metadata", expanded=False):
-                    cols = st.columns(4)
-                    cols[0].metric("Method", result.get("processing", {}).get("method", "-"))
-                    cols[1].metric("Time (s)", f"{result.get('processing', {}).get('time_seconds', 0):.2f}")
-                    cols[2].metric("Task type", result.get("routing", {}).get("task_type", "-"))
-                    cols[3].metric("Memories used", result.get("memory", {}).get("relevant_memories", 0))
+        st.markdown("")
+        col_accept, col_regen, col_discard2 = st.columns(3)
+        with col_accept:
+            if st.button("Accept Response", type="primary", use_container_width=True):
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": output,
-                    "meta": result,
+                    "content": draft_text,
+                    "sources": draft.get("sources", []),
+                    "meta": draft,
                 })
-            else:
-                err = result.get("error", "Unknown error")
-                st.error(err)
-                st.session_state.messages.append({"role": "assistant", "content": f"Error: {err}"})
+                st.session_state.gate_stage = "rating"
+                st.rerun()
+        with col_regen:
+            if st.button("Regenerate", use_container_width=True):
+                with st.spinner("Regenerating..."):
+                    ok3, result2 = api("post", "/synthesize", json={
+                        "query": st.session_state.gate_query,
+                        "approved_chunks": st.session_state.gate_chunks,
+                        "use_recursive": st.session_state.gate_use_recursive,
+                        "use_agents": st.session_state.gate_use_agents,
+                        "persona_id": st.session_state.gate_persona_id,
+                    })
+                if ok3:
+                    st.session_state.gate_response = result2
+                    st.rerun()
+                else:
+                    st.error(result2.get("error", "Regeneration failed"))
+        with col_discard2:
+            if st.button("Discard", use_container_width=True):
+                st.session_state.messages.pop()  # remove the user message added at gate1
+                st.session_state.gate_stage = "idle"
+                st.rerun()
 
-    if st.session_state.messages:
+    # ---- Gate 3: Rate the Response ---------------------------------------------
+    elif st.session_state.gate_stage == "rating":
+        st.divider()
+        st.subheader("Gate 3 — Rate this response")
+        st.caption("Your rating is stored as a fitness signal for NEAT evolution.")
+        draft = st.session_state.gate_response
+        col_up, col_down, col_skip = st.columns(3)
+        with col_up:
+            if st.button("Thumbs Up", type="primary", use_container_width=True):
+                api("post", "/feedback", json={
+                    "query": st.session_state.gate_query,
+                    "response": draft.get("output", ""),
+                    "rating": 1,
+                    "sources": [s["source_file"] for s in draft.get("sources", [])],
+                    "processing_method": draft.get("processing", {}).get("method"),
+                    "session_id": draft.get("session_id"),
+                })
+                st.session_state.gate_stage = "idle"
+                st.rerun()
+        with col_down:
+            if st.button("Thumbs Down", use_container_width=True):
+                api("post", "/feedback", json={
+                    "query": st.session_state.gate_query,
+                    "response": draft.get("output", ""),
+                    "rating": -1,
+                    "sources": [s["source_file"] for s in draft.get("sources", [])],
+                    "processing_method": draft.get("processing", {}).get("method"),
+                    "session_id": draft.get("session_id"),
+                })
+                st.session_state.gate_stage = "idle"
+                st.rerun()
+        with col_skip:
+            if st.button("Skip Rating", use_container_width=True):
+                st.session_state.gate_stage = "idle"
+                st.rerun()
+
+    # ---- Idle: Normal or Gate-Mode Query Input ---------------------------------
+    else:
+        if gate_mode:
+            # Gate mode input — visible form instead of floating chat input
+            with st.form("gate_query_form", clear_on_submit=True):
+                gate_q = st.text_area(
+                    "Ask anything (Gate Mode):",
+                    height=80,
+                    placeholder="Type your question here...",
+                )
+                col_btn, col_rec, col_ag = st.columns([3, 1, 1])
+                submitted = col_btn.form_submit_button("Retrieve Chunks", type="primary")
+                gate_use_recursive_input = col_rec.checkbox("Recursive", value=use_recursive)
+                gate_use_agents_input = col_ag.checkbox("Agents", value=use_agents)
+
+            if submitted and gate_q.strip():
+                with st.spinner("Retrieving chunks..."):
+                    ok_r, r_data = api("post", "/retrieve", json={"query": gate_q.strip()})
+                if ok_r:
+                    st.session_state.gate_query = gate_q.strip()
+                    st.session_state.gate_chunks = r_data.get("chunks", [])
+                    st.session_state.gate_task_type = r_data.get("task_type", "")
+                    st.session_state.gate_use_recursive = gate_use_recursive_input
+                    st.session_state.gate_use_agents = gate_use_agents_input
+                    st.session_state.gate_persona_id = selected_persona_id
+                    st.session_state.messages.append({"role": "user", "content": gate_q.strip()})
+                    st.session_state.gate_stage = "gate1"
+                    st.rerun()
+                else:
+                    st.error(r_data.get("error", "Retrieval failed"))
+        else:
+            # Normal chat input (unchanged from original behaviour)
+            query = st.chat_input("Ask anything...")
+            if query:
+                st.session_state.messages.append({"role": "user", "content": query})
+                with st.chat_message("user"):
+                    st.markdown(query)
+
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        ok, result = api("post", "/query", json={
+                            "query": query,
+                            "use_recursive": use_recursive,
+                            "use_agents": use_agents,
+                            "persona_id": selected_persona_id,
+                        })
+
+                    if ok:
+                        output = result.get("output", "")
+                        st.markdown(output)
+
+                        sources = result.get("sources", [])
+                        if sources:
+                            with st.expander(f"Sources ({len(sources)} chunks)", expanded=False):
+                                for s in sources:
+                                    st.markdown(
+                                        f"**{s['source_file']}** — chunk {s['chunk_index'] + 1}/{s['total_chunks']} "
+                                        f"(score: {s['score']:.2f})"
+                                    )
+                                    st.caption(s["text_preview"])
+                                    st.divider()
+
+                        with st.expander("Metadata", expanded=False):
+                            cols = st.columns(4)
+                            cols[0].metric("Method", result.get("processing", {}).get("method", "-"))
+                            cols[1].metric("Time (s)", f"{result.get('processing', {}).get('time_seconds', 0):.2f}")
+                            cols[2].metric("Task type", result.get("routing", {}).get("task_type", "-"))
+                            cols[3].metric("Memories used", result.get("memory", {}).get("relevant_memories", 0))
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": output,
+                            "sources": result.get("sources", []),
+                            "meta": result,
+                        })
+                    else:
+                        err = result.get("error", "Unknown error")
+                        st.error(err)
+                        st.session_state.messages.append({"role": "assistant", "content": f"Error: {err}"})
+
+    if st.session_state.messages and st.session_state.gate_stage == "idle":
         if st.button("Clear conversation"):
             st.session_state.messages = []
             st.rerun()
