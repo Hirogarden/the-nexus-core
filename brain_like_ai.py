@@ -19,6 +19,7 @@ from layered_memory_system import LayeredMemorySystem, MemoryItem
 from nexus_core_config import config as _config
 from nexus_core_llm_adapters import llm as _llm
 from nexus_core_ingestion import search_knowledge_base as _search_kb, get_knowledge_base_stats as _kb_stats
+from nexus_core_genome import GenomeStore as _GenomeStore
 
 # System prompts for each agent role
 _AGENT_SYSTEM_PROMPTS = {
@@ -138,7 +139,10 @@ class BrainLikeAI:
         self.current_persona: Optional[Persona] = None
         self.session_id: str = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.interaction_count: int = 0
-        
+
+        # NEAT genome store
+        self.genome_store = _GenomeStore(data_dir=str(self.base_path))
+
         print("[BrainLikeAI] Brain-Like AI System initialized successfully")
     
     def retrieve_chunks(
@@ -207,9 +211,12 @@ class BrainLikeAI:
         """
         if context is None:
             context = {}
-        
+
         start_time = datetime.now()
         self.interaction_count += 1
+
+        # Load the active NEAT genome — genes may override config defaults
+        _active_genome = self.genome_store.get_active_genome()
         
         # Step 1: Route the query to determine optimal processing
         routing_decision = self.router.route_query(query, context)
@@ -245,7 +252,7 @@ class BrainLikeAI:
                 retrieved_chunks = _search_kb(
                     expanded_query,
                     data_dir=str(self.base_path),
-                    top_k=_config.search_top_k,
+                    top_k=_active_genome.genes.get("search_top_k", _config.search_top_k),
                 )
                 context["retrieved_chunks"] = retrieved_chunks
             except Exception:
@@ -361,6 +368,7 @@ class BrainLikeAI:
                 for c in context.get("retrieved_chunks", [])
             ],
             "metadata": response.get("metadata", {}),
+            "genome_id": _active_genome.genome_id,
             "timestamp": datetime.now().isoformat()
         }
     

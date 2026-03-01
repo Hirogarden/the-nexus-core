@@ -303,6 +303,7 @@ with tab_chat:
                     "sources": [s["source_file"] for s in draft.get("sources", [])],
                     "processing_method": draft.get("processing", {}).get("method"),
                     "session_id": draft.get("session_id"),
+                    "genome_id": draft.get("genome_id"),
                 })
                 st.session_state.gate_stage = "idle"
                 st.rerun()
@@ -315,6 +316,7 @@ with tab_chat:
                     "sources": [s["source_file"] for s in draft.get("sources", [])],
                     "processing_method": draft.get("processing", {}).get("method"),
                     "session_id": draft.get("session_id"),
+                    "genome_id": draft.get("genome_id"),
                 })
                 st.session_state.gate_stage = "idle"
                 st.rerun()
@@ -637,6 +639,36 @@ with tab_status:
             kb.get("embedding_device") or "N/A",
             help=f"Model: {kb.get('embedding_model') or 'keyword fallback'}",
         )
+
+        st.markdown("---")
+
+        ok_g, genome_data = api("get", "/genome")
+        st.subheader("NEAT Genome")
+        if ok_g:
+            col_n1, col_n2, col_n3, col_n4 = st.columns(4)
+            col_n1.metric("Active genome", genome_data.get("active_genome_id", "-"))
+            col_n2.metric("Generation", genome_data.get("current_generation", 0))
+            col_n3.metric("Fitness", f"{genome_data.get('active_fitness', 0.0):.3f}")
+            col_n4.metric("Ratings collected", genome_data.get("active_fitness_samples", 0))
+
+            genes = genome_data.get("active_genes", {})
+            if genes:
+                with st.expander("Active gene values", expanded=False):
+                    st.json(genes)
+
+            if st.button("Evolve now", help="Run one NEAT generation cycle using collected fitness scores."):
+                ok_e, ev = api("post", "/genome/evolve")
+                if ok_e:
+                    st.success(
+                        f"Evolved to generation {ev.get('new_generation')} — "
+                        f"{ev.get('population_size')} genomes. "
+                        f"New active: {ev.get('active_genome_id')}"
+                    )
+                    st.rerun()
+                else:
+                    st.error(ev.get("error", "Evolution failed"))
+        else:
+            st.warning("Could not load genome data.")
 
         st.markdown("---")
 

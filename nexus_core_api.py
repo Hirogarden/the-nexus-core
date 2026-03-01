@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from nexus_core_config import config
 from brain_like_ai import BrainLikeAI
 from nexus_core_ingestion import ingest_file, get_knowledge_base_stats
+from nexus_core_genome import evolve as _genome_evolve
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +126,7 @@ class FeedbackRequest(BaseModel):
     sources: List[str] = Field(default_factory=list, description="Source files used")
     processing_method: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
+    genome_id: Optional[str] = Field(None, description="ID of the genome that produced this response")
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +246,7 @@ async def feedback(req: FeedbackRequest):
     """
     Gate 3 fitness signal — record a user rating (thumbs up/down) for a response.
     Written to nexus_data/fitness/fitness_log.jsonl for use by NEAT evolution.
+    If genome_id is provided the rating is also recorded against that genome.
     """
     try:
         brain = _get_brain()
@@ -254,8 +257,17 @@ async def feedback(req: FeedbackRequest):
             "sources": req.sources,
             "processing_method": req.processing_method,
             "session_id": req.session_id or brain.session_id,
+            "genome_id": req.genome_id,
         })
-        return {"status": "ok", "rating": req.rating}
+        updated_genome = None
+        if req.genome_id:
+            updated_genome = brain.genome_store.record_fitness(req.genome_id, req.rating)
+        return {
+            "status": "ok",
+            "rating": req.rating,
+            "genome_fitness": round(updated_genome.fitness, 4) if updated_genome else None,
+            "genome_fitness_samples": updated_genome.fitness_samples if updated_genome else None,
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -417,6 +429,44 @@ async def knowledge_base_stats():
 # ---------------------------------------------------------------------------
 # Entry point (for running directly: python nexus_core_api.py)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# NEAT Genome routes
+# ---------------------------------------------------------------------------
+
+@app.get("/genome", tags=["NEAT"])
+async def genome_stats():
+    """
+    Return stats about the current NEAT genome population:
+    active genome id, its fitness, genes, and generation info.
+    """
+    try:
+        brain = _get_brain()
+        return brain.genome_store.get_stats()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/genome/evolve", tags=["NEAT"])
+async def genome_evolve():
+    """
+    Trigger one NEAT generation cycle.
+    Elite genomes (by fitness) are carried forward; offspring are produced
+    via crossover + mutation.  The new best genome becomes the active genome.
+    """
+    try:
+        brain = _get_brain()
+        new_pop, new_active = _genome_evolve(brain.genome_store)
+        return {
+            "status": "ok",
+            "new_generation": new_active.generation,
+            "population_size": len(new_pop),
+            "active_genome_id": new_active.genome_id,
+            "active_genes": new_active.genes,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 if __name__ == "__main__":
     import uvicorn
