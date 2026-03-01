@@ -141,6 +141,14 @@ _SEED_PERSONAS = [
     ("Historical Researcher","historical"),
 ]
 
+# Queries that already open with a directive word carry their own intent — adding
+# a strategy prefix on top (e.g. "definition of what is X") produces garbled search
+# strings.  The prefix is suppressed for these; the suffix still runs.
+_INTERROGATIVE_START = re.compile(
+    r"^\s*(what|how|why|when|where|which|who|explain|describe|compare|list|give)\b",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Warm-up state
@@ -247,9 +255,17 @@ class ResearchPersona:
     # ----- Computed helpers -------------------------------------------------
 
     def reformulate(self, query: str) -> str:
-        """Produce the search query this persona would issue."""
+        """Produce the search query this persona would issue.
+
+        The prefix is suppressed when the raw query already starts with an
+        interrogative or directive word (what/how/why/explain/…).  Stacking
+        a strategy prefix on top of such queries produces garbled strings
+        (e.g. "definition of what is X definition") that harm search quality.
+        The suffix is always appended; it acts as a keyword hint that doesn't
+        interact with the query's grammatical structure.
+        """
         parts = []
-        if self.prefix:
+        if self.prefix and not _INTERROGATIVE_START.match(query):
             parts.append(self.prefix)
         parts.append(query)
         if self.suffix:

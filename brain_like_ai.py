@@ -471,8 +471,13 @@ class BrainLikeAI:
             "timestamp": datetime.now().isoformat()
         }
     
-    def _build_system_prompt(self) -> str:
-        """Build a system prompt from the active persona (if any)."""
+    def _build_system_prompt(self, context: Optional[Dict[str, Any]] = None) -> str:
+        """Build a system prompt from the active persona (if any).
+
+        If context contains a 'persona.behavior' dict produced by
+        adapt_persona_to_context(), the verbosity/formality/empathy scores
+        are translated into concrete style instructions appended to the prompt.
+        """
         if not self.current_persona:
             return ""
         p = self.current_persona
@@ -483,6 +488,29 @@ class BrainLikeAI:
             parts.append(f"Your goals are: {', '.join(p.goals)}.")
         if p.communication_style:
             parts.append(f"Communication style: {p.communication_style}.")
+
+        # Apply context-adapted behaviour if available
+        behavior = (context or {}).get("persona", {}).get("behavior", {})
+        if behavior:
+            hints: List[str] = []
+            verbosity = behavior.get("verbosity")
+            formality  = behavior.get("formality")
+            empathy    = behavior.get("empathy")
+            if verbosity is not None:
+                if verbosity < 0.3:
+                    hints.append("Be concise.")
+                elif verbosity > 0.7:
+                    hints.append("Be thorough and detailed.")
+            if formality is not None:
+                if formality > 0.7:
+                    hints.append("Maintain a formal tone.")
+                elif formality < 0.3:
+                    hints.append("Use a casual, conversational tone.")
+            if empathy is not None and empathy > 0.7:
+                hints.append("Be empathetic and supportive.")
+            if hints:
+                parts.append(" ".join(hints))
+
         return " ".join(parts)
 
     def _build_rag_query(self, query: str, context: Dict[str, Any]) -> str:
@@ -522,7 +550,7 @@ class BrainLikeAI:
     def _process_direct(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """Direct processing - single LLM call."""
         augmented_query = self._build_rag_query(query, context)
-        output = _llm.complete(augmented_query, system_prompt=self._build_system_prompt(), context=context)
+        output = _llm.complete(augmented_query, system_prompt=self._build_system_prompt(context), context=context)
         return {"output": output, "metadata": {"method": "direct"}}
 
     def _process_recursive(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -530,7 +558,7 @@ class BrainLikeAI:
         augmented_query = self._build_rag_query(query, context)
         result = self.recursive_model.recursive_process(
             augmented_query,
-            _llm.as_processor(system_prompt=self._build_system_prompt()),
+            _llm.as_processor(system_prompt=self._build_system_prompt(context)),
             context
         )
 
@@ -770,7 +798,14 @@ class BrainLikeAI:
             general_queries = general_queries + extras[:shortfall]
 
         # --- Blend and shuffle -------------------------------------------
-        combined = kb_queries + general_queries
+        # Deduplicate across both pools (KB templates can overlap with general
+        # queries) while preserving KB-first ordering before the shuffle.
+        seen: set = set()
+        combined: List[str] = []
+        for q in kb_queries + general_queries:
+            if q not in seen:
+                seen.add(q)
+                combined.append(q)
         _random.shuffle(combined)
         return combined[:target_count]
 
