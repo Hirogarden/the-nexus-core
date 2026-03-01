@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 from pathlib import Path
 import json
+import threading
 
 # Import all the subsystems
 from recursive_language_model import RecursiveLanguageModel, ReasoningChainBuilder
@@ -153,6 +154,10 @@ class BrainLikeAI:
 
         # Research swarm — multi-perspective KB search with continuous evolution
         self.swarm = _ResearchSwarm(data_dir=str(self.base_path))
+
+        # Warmup threading controls
+        self._warmup_thread:     Optional[threading.Thread] = None
+        self._warmup_stop_event: threading.Event            = threading.Event()
 
         print("[BrainLikeAI] Brain-Like AI System initialized successfully")
     
@@ -592,8 +597,123 @@ class BrainLikeAI:
             top_k=20
         )
     
+    def _generate_warmup_queries(self, target_count: int = 30) -> List[str]:
+        """
+        Build a list of seed queries for the swarm warm-up.
+
+        Extracts the top keywords from a sample of KB chunks and turns them
+        into short query phrases (e.g. "what is {kw}", "{kw} overview").
+        Falls back to a built-in list of generic probes when the KB is empty.
+        """
+        from nexus_core_hirag import _top_keywords
+
+        keywords: List[str] = []
+        try:
+            sample = _search_kb(
+                "information",
+                data_dir=str(self.base_path),
+                top_k=40,
+            )
+            texts = [c.get("text", "") for c in sample]
+            if texts:
+                keywords = _top_keywords(texts, n=25)
+        except Exception:
+            pass
+
+        queries: List[str] = []
+        templates = [
+            "{kw}",
+            "what is {kw}",
+            "{kw} overview",
+            "how does {kw} work",
+            "examples of {kw}",
+        ]
+        for kw in keywords:
+            for tmpl in templates:
+                queries.append(tmpl.format(kw=kw))
+                if len(queries) >= target_count:
+                    break
+            if len(queries) >= target_count:
+                break
+
+        # Fallback if KB is empty or has too few keywords
+        if len(queries) < 10:
+            queries += [
+                "overview of main topics",
+                "key concepts and definitions",
+                "how does this work",
+                "important information summary",
+                "technical details and specifications",
+                "practical examples and use cases",
+                "history and background",
+                "current status and updates",
+                "analysis and insights",
+                "step by step guide",
+                "what are the main components",
+                "common problems and solutions",
+            ]
+
+        return queries[:target_count]
+
+    def start_swarm_warmup(
+        self,
+        max_iterations: int = 50,
+        max_seconds: float = 300.0,
+    ) -> Dict[str, Any]:
+        """
+        Start the swarm warm-up in a background daemon thread.
+
+        If a warmup session is already running, returns its current status
+        without starting a second one.
+
+        Parameters
+        ----------
+        max_iterations
+            Maximum number of search iterations to run (default 50).
+        max_seconds
+            Maximum wall-clock seconds to run (default 300 = 5 minutes).
+        """
+        if self.swarm._warmup_state.running:
+            return {
+                "status": "already_running",
+                **self.swarm.get_warmup_status(),
+            }
+
+        self._warmup_stop_event.clear()
+        queries = self._generate_warmup_queries()
+
+        def _run() -> None:
+            self.swarm.run_warmup(
+                queries=queries,
+                kb_search_fn=lambda q, k: _search_kb(
+                    q, data_dir=str(self.base_path), top_k=k
+                ),
+                max_iterations=max_iterations,
+                max_seconds=max_seconds,
+                top_k=_config.search_top_k,
+                stop_event=self._warmup_stop_event,
+            )
+
+        self._warmup_thread = threading.Thread(
+            target=_run, daemon=True, name="swarm-warmup"
+        )
+        self._warmup_thread.start()
+
+        return {"status": "started", **self.swarm.get_warmup_status()}
+
+    def stop_swarm_warmup(self) -> Dict[str, Any]:
+        """
+        Signal the running warmup to stop after its current iteration.
+        Returns immediately; the background thread may not have stopped yet.
+        """
+        self._warmup_stop_event.set()
+        return {"status": "stop_signaled", **self.swarm.get_warmup_status()}
+
+    def get_swarm_warmup_status(self) -> Dict[str, Any]:
+        """Return the current warmup session state."""
+        return self.swarm.get_warmup_status()
+
     def export_session(self) -> str:
-        """Export current session data."""
         status = self.get_system_status()
         
         return json.dumps({

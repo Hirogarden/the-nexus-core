@@ -26,6 +26,8 @@ Persistence
 import json
 import random
 import re
+import threading
+import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -132,6 +134,56 @@ _SEED_PERSONAS = [
     ("Practical Applier",    "practical"),
     ("Historical Researcher","historical"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Warm-up state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WarmupState:
+    """
+    Tracks the progress of a background warm-up session.
+
+    Attributes
+    ----------
+    running               — True while the warmup thread is active.
+    iterations_completed  — Number of search iterations finished so far.
+    iterations_target     — The max_iterations ceiling requested.
+    seconds_target        — The max_seconds ceiling requested.
+    evolutions_triggered  — Competition rounds that fired during this session.
+    seed_query_count      — Number of distinct seed queries available.
+    started_at            — ISO timestamp of session start, or None.
+    finished_at           — ISO timestamp of session end, or None.
+    stop_reason           — Why the session ended:
+                              "iterations"      — hit max_iterations
+                              "time"            — hit max_seconds
+                              "stopped_by_user" — stop_event was set
+                              "no_queries"      — empty query list
+                              ""                — not yet finished
+    """
+    running:              bool           = False
+    iterations_completed: int            = 0
+    iterations_target:    int            = 0
+    seconds_target:       float          = 0.0
+    evolutions_triggered: int            = 0
+    seed_query_count:     int            = 0
+    started_at:           Optional[str]  = None
+    finished_at:          Optional[str]  = None
+    stop_reason:          str            = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "running":              self.running,
+            "iterations_completed": self.iterations_completed,
+            "iterations_target":    self.iterations_target,
+            "seconds_target":       self.seconds_target,
+            "evolutions_triggered": self.evolutions_triggered,
+            "seed_query_count":     self.seed_query_count,
+            "started_at":           self.started_at,
+            "finished_at":          self.finished_at,
+            "stop_reason":          self.stop_reason,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +409,13 @@ class ResearchSwarm:
         # Running counter of total individual-persona searches since last
         # evolution trigger.
         self._searches_since_evolve: int = 0
+
+        # Total number of competition rounds that have ever fired on this instance.
+        # Used by warmup to count evolutions triggered during a session.
+        self._evolution_count: int = 0
+
+        # Warmup session state (in-memory only, not persisted)
+        self._warmup_state: WarmupState = WarmupState()
 
         self._ensure_seeded()
 
@@ -593,6 +652,7 @@ class ResearchSwarm:
         self._save_all(list(by_id.values()))
         self._save_active_ids(new_active_ids)
 
+        self._evolution_count += 1
         print(
             f"[swarm] Evolution: eliminated '{weakest.name}' "
             f"(fitness={weakest.fitness:.3f} over {weakest.search_count} searches) "
@@ -617,6 +677,96 @@ class ResearchSwarm:
             "challenger_id": new_id,
             "active_now": [p.to_dict() for p in curr_active],
         }
+
+    # ------------------------------------------------------------------
+    # Warm-up
+    # ------------------------------------------------------------------
+
+    def run_warmup(
+        self,
+        queries: List[str],
+        kb_search_fn: Callable[[str, int], List[Dict[str, Any]]],
+        max_iterations: int = 50,
+        max_seconds: float = 300.0,
+        top_k: int = 5,
+        stop_event: Optional[threading.Event] = None,
+    ) -> "WarmupState":
+        """
+        Run warm-up iterations in the calling thread.
+
+        Intended to be called from a background thread via
+        ``BrainLikeAI.start_swarm_warmup()``.  Each iteration picks a random
+        query from *queries*, calls ``search()``, and lets the normal fitness /
+        competition machinery run.
+
+        The loop terminates when any of these conditions is met (whichever
+        comes first):
+
+        * *max_iterations* iterations have completed  → stop_reason "iterations"
+        * *max_seconds* wall-clock seconds have elapsed → stop_reason "time"
+        * *stop_event* is set by the caller             → stop_reason "stopped_by_user"
+        * *queries* is empty                            → stop_reason "no_queries"
+
+        Note on thread safety
+        ---------------------
+        This method writes to shared JSONL files.  In the expected use case
+        (user steps away, warmup runs solo) concurrent writes are extremely
+        unlikely.  If you need concurrent query processing and warmup, add an
+        external lock around ``search()`` calls.
+        """
+        state = self._warmup_state
+        state.running              = True
+        state.iterations_completed = 0
+        state.iterations_target    = max_iterations
+        state.seconds_target       = max_seconds
+        state.seed_query_count     = len(queries)
+        state.evolutions_triggered = 0
+        state.started_at           = _now_iso()
+        state.finished_at          = None
+        state.stop_reason          = ""
+
+        evolutions_before = self._evolution_count
+        start_wall        = time.monotonic()
+
+        try:
+            if not queries:
+                state.stop_reason = "no_queries"
+                return state
+
+            for i in range(max_iterations):
+                # --- stop checks (before doing work) ---
+                if stop_event is not None and stop_event.is_set():
+                    state.stop_reason = "stopped_by_user"
+                    break
+
+                elapsed = time.monotonic() - start_wall
+                if elapsed >= max_seconds:
+                    state.stop_reason = "time"
+                    break
+
+                # --- one iteration ---
+                query = random.choice(queries)
+                try:
+                    self.search(query, kb_search_fn, top_k=top_k)
+                except Exception:
+                    pass   # individual failures don't abort the session
+
+                state.iterations_completed = i + 1
+                state.evolutions_triggered = self._evolution_count - evolutions_before
+            else:
+                # Loop ran to completion without break
+                state.stop_reason = "iterations"
+
+        finally:
+            state.running              = False
+            state.finished_at          = _now_iso()
+            state.evolutions_triggered = self._evolution_count - evolutions_before
+
+        return state
+
+    def get_warmup_status(self) -> Dict[str, Any]:
+        """Return the current warmup session state as a plain dict."""
+        return self._warmup_state.to_dict()
 
     # ------------------------------------------------------------------
     # Stats

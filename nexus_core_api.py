@@ -135,6 +135,11 @@ class FeedbackRequest(BaseModel):
     genome_id: Optional[str] = Field(None, description="ID of the genome that produced this response")
 
 
+class WarmupStartRequest(BaseModel):
+    max_iterations: int   = Field(50,    ge=1, le=2000, description="Maximum search iterations")
+    max_seconds:    float = Field(300.0, gt=0, le=7200, description="Maximum run time in seconds")
+
+
 # ---------------------------------------------------------------------------
 # System routes
 # ---------------------------------------------------------------------------
@@ -531,6 +536,55 @@ async def swarm_evolve():
     try:
         result = _get_brain().swarm.force_evolve()
         return {"status": "ok", **result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/swarm/warmup/start", tags=["Research Swarm"])
+async def swarm_warmup_start(req: WarmupStartRequest):
+    """
+    Start an autonomous warm-up training session for the Research Swarm.
+
+    Runs in a background daemon thread so the API stays responsive.
+    Each iteration picks a random seed query (derived from KB keywords),
+    runs all active personas against it, and updates their fitness.
+    Competition rounds fire automatically at the normal threshold.
+
+    If a warm-up is already running, returns its current status without
+    starting a second session.
+    """
+    try:
+        result = _get_brain().start_swarm_warmup(
+            max_iterations=req.max_iterations,
+            max_seconds=req.max_seconds,
+        )
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/swarm/warmup/status", tags=["Research Swarm"])
+async def swarm_warmup_status():
+    """
+    Return the current warm-up session state:
+    whether it is running, how many iterations have completed,
+    how many evolutions have fired, and why it stopped (if finished).
+    """
+    try:
+        return _get_brain().get_swarm_warmup_status()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/swarm/warmup/stop", tags=["Research Swarm"])
+async def swarm_warmup_stop():
+    """
+    Signal the running warm-up session to stop after its current iteration.
+    Returns immediately; the background thread may still be finishing its
+    last search.
+    """
+    try:
+        return _get_brain().stop_swarm_warmup()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

@@ -787,6 +787,76 @@ with tab_status:
                     st.rerun()
                 else:
                     st.error(se.get("error", "Evolution failed"))
+
+            st.markdown("**Warm-up Training**")
+            st.caption(
+                "Run the swarm autonomously against KB-derived queries so personas "
+                "accumulate fitness scores without needing real user traffic."
+            )
+            ok_wu, wu = api("get", "/swarm/warmup/status")
+            wu_running = ok_wu and wu.get("running", False)
+
+            if wu_running:
+                iters_done   = wu.get("iterations_completed", 0)
+                iters_target = wu.get("iterations_target", 1) or 1
+                secs_target  = wu.get("seconds_target", 300)
+                evols        = wu.get("evolutions_triggered", 0)
+
+                st.progress(
+                    min(iters_done / iters_target, 1.0),
+                    text=f"Iteration {iters_done} / {iters_target} "
+                         f"— {evols} evolution(s) triggered",
+                )
+                col_wu1, col_wu2, col_wu3 = st.columns(3)
+                col_wu1.metric("Iterations done", iters_done)
+                col_wu2.metric("Target",          iters_target)
+                col_wu3.metric("Max seconds",      int(secs_target))
+
+                if st.button("Stop warm-up", key="wu_stop", type="primary"):
+                    api("post", "/swarm/warmup/stop")
+                    st.info("Stop signal sent — finishing current iteration…")
+                    st.rerun()
+            else:
+                if ok_wu and wu.get("finished_at"):
+                    stop_reason_labels = {
+                        "iterations":      "completed all iterations",
+                        "time":            "time limit reached",
+                        "stopped_by_user": "stopped by user",
+                        "no_queries":      "no seed queries available",
+                    }
+                    reason = stop_reason_labels.get(
+                        wu.get("stop_reason", ""), wu.get("stop_reason", "—")
+                    )
+                    st.caption(
+                        f"Last session: {wu.get('iterations_completed', 0)} iterations, "
+                        f"{wu.get('evolutions_triggered', 0)} evolutions — {reason}."
+                    )
+
+                col_wua, col_wub = st.columns(2)
+                with col_wua:
+                    wu_iters = st.number_input(
+                        "Iterations", min_value=1, max_value=2000,
+                        value=50, step=10, key="wu_iters",
+                    )
+                with col_wub:
+                    wu_mins = st.number_input(
+                        "Max minutes", min_value=1, max_value=120,
+                        value=5, step=1, key="wu_mins",
+                    )
+                if st.button("Start warm-up", key="wu_start", type="primary"):
+                    ok_wus, wus = api(
+                        "post", "/swarm/warmup/start",
+                        json={"max_iterations": int(wu_iters),
+                              "max_seconds":    float(wu_mins * 60)},
+                    )
+                    if ok_wus:
+                        st.success(
+                            f"Warm-up started — {wus.get('seed_query_count', '?')} "
+                            "seed queries loaded."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(wus.get("error", "Could not start warm-up"))
         else:
             st.warning("Could not load Research Swarm data.")
 
