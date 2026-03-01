@@ -9,6 +9,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
+from nexus_core_config import config as _config
+
 # Optional dependencies - graceful degradation if not available
 try:
     from llama_index.core import VectorStoreIndex, Document, StorageContext, load_index_from_storage
@@ -29,9 +31,9 @@ class NexusCoreEngine:
     Works with zero dependencies but enhanced with LlamaIndex/LangChain if available.
     """
     
-    def __init__(self, base_path: str = "./nexus_data"):
+    def __init__(self, base_path: str = None):
         """Initialize the Nexus Core engine."""
-        self.base_path = Path(base_path)
+        self.base_path = Path(base_path) if base_path else Path(_config.nexus_data_path)
         self.conversations_path = self.base_path / "conversations"
         self.index_path = self.base_path / "indices"
         self.sessions_path = self.base_path / "sessions"

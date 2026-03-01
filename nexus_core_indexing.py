@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 import json
 
+from nexus_core_config import config as _config
+
 try:
     from llama_index.core import (
         VectorStoreIndex, 
@@ -31,9 +33,9 @@ class HierarchicalIndexManager:
     4. Keyword Table Index (exact match)
     """
     
-    def __init__(self, index_path: str = "./nexus_data/indices"):
+    def __init__(self, index_path: str = None):
         """Initialize hierarchical index manager."""
-        self.index_path = Path(index_path)
+        self.index_path = Path(index_path) if index_path else Path(_config.nexus_data_path) / "indices"
         self.index_path.mkdir(parents=True, exist_ok=True)
         
         if not LLAMA_INDEX_AVAILABLE:

@@ -9,6 +9,8 @@ import hashlib
 import re
 from collections import defaultdict, Counter
 
+from nexus_core_config import config as _config
+
 
 class CitationManager:
     """
@@ -120,8 +122,8 @@ class ContextWindowManager:
     Smart compression and prioritization for long conversations.
     """
     
-    def __init__(self, max_tokens: int = 4096):
-        self.max_tokens = max_tokens
+    def __init__(self, max_tokens: int = None):
+        self.max_tokens = max_tokens if max_tokens is not None else _config.context_max_tokens
     
     def compress_context(
         self,
@@ -218,8 +220,8 @@ class DeduplicationEngine:
     Remove duplicate or near-duplicate search results.
     """
     
-    def __init__(self, similarity_threshold: float = 0.85):
-        self.similarity_threshold = similarity_threshold
+    def __init__(self, similarity_threshold: float = None):
+        self.similarity_threshold = similarity_threshold if similarity_threshold is not None else _config.dedup_similarity_threshold
     
     def deduplicate_results(
         self,
@@ -414,8 +416,8 @@ class ConversationThreadTracker:
     Detect and maintain separate conversation topics.
     """
     
-    def __init__(self, topic_change_threshold: float = 0.5):
-        self.topic_change_threshold = topic_change_threshold
+    def __init__(self, topic_change_threshold: float = None):
+        self.topic_change_threshold = topic_change_threshold if topic_change_threshold is not None else _config.topic_change_threshold
         self.threads: List[Dict[str, Any]] = []
         self.current_thread_id: Optional[str] = None
     
@@ -593,11 +595,11 @@ class MetadataEnricher:
     
     def _label_quality(self, quality_score: float) -> str:
         """Convert quality score to human label."""
-        if quality_score >= 0.8:
+        if quality_score >= _config.quality_high_threshold:
             return "High quality"
-        elif quality_score >= 0.6:
+        elif quality_score >= _config.quality_med_threshold:
             return "Good quality"
-        elif quality_score >= 0.4:
+        elif quality_score >= _config.quality_low_threshold:
             return "Fair quality"
         else:
             return "Lower quality"
