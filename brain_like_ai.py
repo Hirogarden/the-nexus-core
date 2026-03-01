@@ -21,6 +21,7 @@ from nexus_core_llm_adapters import llm as _llm
 from nexus_core_ingestion import search_knowledge_base as _search_kb, get_knowledge_base_stats as _kb_stats
 from nexus_core_genome import GenomeStore as _GenomeStore
 from nexus_core_hirag import HiRAGMemory as _HiRAGMemory
+from nexus_core_research_swarm import ResearchSwarm as _ResearchSwarm
 
 # System prompts for each agent role
 _AGENT_SYSTEM_PROMPTS = {
@@ -150,6 +151,9 @@ class BrainLikeAI:
             summarize_fn=lambda p: _llm.complete(p),
         )
 
+        # Research swarm — multi-perspective KB search with continuous evolution
+        self.swarm = _ResearchSwarm(data_dir=str(self.base_path))
+
         print("[BrainLikeAI] Brain-Like AI System initialized successfully")
     
     def retrieve_chunks(
@@ -168,9 +172,11 @@ class BrainLikeAI:
         if self.query_expander:
             expanded_query, _ = self.query_expander.expand_query(query)
         try:
-            chunks = _search_kb(
+            chunks = self.swarm.search(
                 expanded_query,
-                data_dir=str(self.base_path),
+                kb_search_fn=lambda q, k: _search_kb(
+                    q, data_dir=str(self.base_path), top_k=k
+                ),
                 top_k=_config.search_top_k,
             )
         except Exception:
@@ -259,9 +265,11 @@ class BrainLikeAI:
             context["retrieved_chunks"] = _preloaded_chunks
         else:
             try:
-                retrieved_chunks = _search_kb(
+                retrieved_chunks = self.swarm.search(
                     expanded_query,
-                    data_dir=str(self.base_path),
+                    kb_search_fn=lambda q, k: _search_kb(
+                        q, data_dir=str(self.base_path), top_k=k
+                    ),
                     top_k=_active_genome.genes.get("search_top_k", _config.search_top_k),
                 )
                 context["retrieved_chunks"] = retrieved_chunks
@@ -533,6 +541,7 @@ class BrainLikeAI:
             "personas": len(self.chargen.list_personas()),
             "knowledge_base": kb_stats,
             "hirag": self.hirag.get_stats(),
+            "swarm": self.swarm.get_stats(),
             "timestamp": datetime.now().isoformat()
         }
     

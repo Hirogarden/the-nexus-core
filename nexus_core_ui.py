@@ -725,6 +725,73 @@ with tab_status:
 
         st.markdown("---")
 
+        ok_sw, swarm_data = api("get", "/swarm")
+        st.subheader("Research Swarm")
+        if ok_sw:
+            col_sw1, col_sw2, col_sw3, col_sw4 = st.columns(4)
+            col_sw1.metric("Active personas",    swarm_data.get("active_count", 0))
+            col_sw2.metric("Eliminated",         swarm_data.get("eliminated_count", 0))
+            col_sw3.metric("Total ever created", swarm_data.get("total_personas", 0))
+            col_sw4.metric(
+                "Searches until evolve",
+                max(0, swarm_data.get("competition_interval", 20)
+                    - swarm_data.get("searches_since_evolve", 0)),
+            )
+
+            active_personas = swarm_data.get("active_personas", [])
+            if active_personas:
+                with st.expander("Active research personas (ranked by fitness)", expanded=True):
+                    for p in active_personas:
+                        bar_pct = int(p["fitness"] * 100)
+                        st.markdown(
+                            f"**{p['name']}** &nbsp;·&nbsp; "
+                            f"strategy: `{p['strategy']}` &nbsp;·&nbsp; "
+                            f"gen {p['generation']}"
+                        )
+                        st.caption(
+                            f"prefix: *\"{p['prefix']}\"*  |  "
+                            f"suffix: *\"{p['suffix']}\"*"
+                        )
+                        cols_p = st.columns([3, 1, 1])
+                        cols_p[0].progress(bar_pct, text=f"Fitness {p['fitness']:.3f}")
+                        cols_p[1].metric("Searches", p["search_count"])
+                        cols_p[2].metric("Hits",     p["hit_count"])
+                        st.divider()
+
+            top_elim = swarm_data.get("top_eliminated", [])
+            if top_elim:
+                with st.expander("Top eliminated personas", expanded=False):
+                    for p in top_elim:
+                        st.markdown(
+                            f"`{p['persona_id']}` **{p['name']}** — "
+                            f"fitness {p['fitness']:.3f} over {p['search_count']} searches "
+                            f"(gen {p['generation']}, strategy `{p['strategy']}`)"
+                        )
+
+            if st.button(
+                "Evolve swarm now",
+                key="swarm_evolve",
+                help="Eliminate the weakest persona and introduce a mutated challenger.",
+            ):
+                ok_se, se = api("post", "/swarm/evolve")
+                if ok_se:
+                    elim = se.get("eliminated", [])
+                    cid  = se.get("challenger_id")
+                    if elim:
+                        st.success(
+                            f"Eliminated '{elim[0]['name']}' "
+                            f"— challenger {cid} introduced."
+                        )
+                    else:
+                        st.info("No persona had enough samples to eliminate yet.")
+                    st.rerun()
+                else:
+                    st.error(se.get("error", "Evolution failed"))
+        else:
+            st.warning("Could not load Research Swarm data.")
+
+        st.markdown("---")
+
         st.subheader("Session management")
         if st.button(
             "Start new session",

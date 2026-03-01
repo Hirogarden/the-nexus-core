@@ -506,6 +506,35 @@ async def hirag_compress():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/swarm", tags=["Research Swarm"])
+async def swarm_stats():
+    """
+    Return statistics for the Research Swarm:
+    active personas with fitness scores, eliminated personas, and the
+    number of searches until the next automatic competition round.
+    """
+    try:
+        return _get_brain().swarm.get_stats()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/swarm/evolve", tags=["Research Swarm"])
+async def swarm_evolve():
+    """
+    Manually trigger one Research Swarm competition round.
+
+    The weakest active persona (with enough search samples) is eliminated
+    and replaced by a challenger bred from the strongest active persona.
+    Returns a summary of what was eliminated and what was introduced.
+    """
+    try:
+        result = _get_brain().swarm.force_evolve()
+        return {"status": "ok", **result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
