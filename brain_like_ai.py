@@ -80,7 +80,7 @@ class BrainLikeAI:
         self.base_path.mkdir(parents=True, exist_ok=True)
 
         # Initialize all subsystems
-        print("🧠 Initializing Brain-Like AI System...")
+        print("[BrainLikeAI] Initializing Brain-Like AI System...")
 
         # Core cognitive components
         self.recursive_model = RecursiveLanguageModel(
@@ -139,7 +139,7 @@ class BrainLikeAI:
         self.session_id: str = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.interaction_count: int = 0
         
-        print("✅ Brain-Like AI System initialized successfully")
+        print("[BrainLikeAI] Brain-Like AI System initialized successfully")
     
     def process_query(
         self,
@@ -512,14 +512,14 @@ class BrainLikeAI:
 def demo_brain_like_ai():
     """Demonstration of the brain-like AI system."""
     print("="*60)
-    print("🧠 BRAIN-LIKE AI SYSTEM DEMONSTRATION")
+    print("BRAIN-LIKE AI SYSTEM DEMONSTRATION")
     print("="*60)
     
     # Initialize system
     brain = BrainLikeAI("./demo_brain_ai")
     
     # Set a persona
-    print("\n👤 Setting expert persona...")
+    print("\nSetting expert persona...")
     brain.set_persona(template="expert")
     
     # Process some queries
@@ -540,10 +540,10 @@ def demo_brain_like_ai():
             use_agents=(i == 3)  # Use agents for query 3
         )
         
-        print(f"\n📤 Response:")
+        print(f"\nResponse:")
         print(f"{result['output'][:200]}...")
         
-        print(f"\n📊 Metadata:")
+        print(f"\nMetadata:")
         print(f"   Task Type: {result['routing']['task_type']}")
         print(f"   Processing: {result['processing']['method']}")
         print(f"   Time: {result['processing']['time_seconds']:.3f}s")
@@ -551,7 +551,7 @@ def demo_brain_like_ai():
     
     # Create a bookmark
     print(f"\n{'='*60}")
-    print("🔖 Creating bookmark...")
+    print("Creating bookmark...")
     bookmark = brain.create_bookmark(
         content="Neural networks are computational models inspired by biological neural networks",
         title="Neural Networks Definition",
@@ -561,7 +561,7 @@ def demo_brain_like_ai():
     
     # Show system status
     print(f"\n{'='*60}")
-    print("📊 System Status:")
+    print("System Status:")
     status = brain.get_system_status()
     print(f"   Interactions: {status['interactions']}")
     print(f"   STM Count: {status['memory']['short_term']['count']}")
@@ -570,7 +570,7 @@ def demo_brain_like_ai():
     print(f"   Routing Decisions: {status['routing']['total_decisions']}")
     
     print(f"\n{'='*60}")
-    print("✅ Demonstration complete!")
+    print("Demonstration complete!")
     print("="*60)
 
 
