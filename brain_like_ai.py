@@ -48,11 +48,17 @@ _AGENT_SYSTEM_PROMPTS = {
 # ---------------------------------------------------------------------------
 # General-purpose warmup queries (domain-agnostic)
 #
-# These are intentionally unrelated to any specific knowledge base so that
-# swarm personas are evaluated on *breadth*, not just on the KB's own topics.
-# Mixing them into the warmup seed pool prevents over-specialisation: a persona
-# strategy that can only reformulate narrow KB queries will score lower on
-# these, giving generalist strategies a competitive pressure to survive.
+# Mixed into the warmup seed pool alongside KB-derived queries to provide
+# query variety.  Note: because all queries are evaluated against the same
+# KB, general queries that have no matching KB content result in zero hits
+# for ALL personas equally — so they do not directly select for generalist
+# strategies.  Anti-specialisation pressure is instead enforced by the
+# evolution mechanism in ResearchSwarm._run_competition(), which applies a
+# fitness penalty to over-represented strategy types and periodically
+# re-injects missing strategies regardless of fitness.  These general queries
+# still serve a useful signal when the KB *does* contain relevant content
+# (e.g. a methodology or concept document), giving personas that reformulate
+# broadly a chance to surface chunks they might otherwise miss.
 # ---------------------------------------------------------------------------
 _GENERAL_WARMUP_QUERIES: List[str] = [
     # Conceptual / definitional
@@ -323,7 +329,12 @@ class BrainLikeAI:
                     kb_search_fn=lambda q, k: _search_kb(
                         q, data_dir=str(self.base_path), top_k=k
                     ),
-                    top_k=_active_genome.genes.get("search_top_k", _config.search_top_k),
+                    # Clamp genome-evolved top_k to a safe range: at least 1,
+                    # at most 50, to guard against a mutated gene of 0 or a
+                    # runaway value that would saturate memory.
+                    top_k=max(1, min(50, int(
+                        _active_genome.genes.get("search_top_k", _config.search_top_k)
+                    ))),
                 )
                 context["retrieved_chunks"] = retrieved_chunks
             except Exception:
@@ -397,14 +408,25 @@ class BrainLikeAI:
                 }
             )
         
-        # Step 9: Perform memory consolidation periodically
+        # Step 9: Perform memory consolidation periodically (background thread
+        # — avoids blocking the user response on every 5th query)
         if self.interaction_count % 5 == 0:
-            self.memory.consolidate_memories()
+            threading.Thread(
+                target=self.memory.consolidate_memories,
+                daemon=True,
+                name="memory-consolidate",
+            ).start()
 
-        # Step 9b: Ingest turn into HiRAG and trigger compression if needed
+        # Step 9b: Ingest turn into HiRAG synchronously (order matters for
+        # retrieval accuracy), but run the potentially LLM-heavy compression
+        # pass in a background thread so it doesn't add latency.
         _output_text = response.get("output", "")
         self.hirag.ingest_turn(query, _output_text, session_id=self.session_id)
-        self.hirag.maybe_compress()
+        threading.Thread(
+            target=self.hirag.maybe_compress,
+            daemon=True,
+            name="hirag-compress",
+        ).start()
 
         # Step 10: Compile comprehensive response
         processing_time = (datetime.now() - start_time).total_seconds()
@@ -527,18 +549,32 @@ class BrainLikeAI:
         """Process using meta-agent decomposition."""
         # Decompose task
         subtasks = self.meta_agents.decompose_task(query, context)
-        
+
         # Execute workflow
         workflow_result = self.meta_agents.execute_workflow(subtasks)
-        
-        # Compile results
+
+        # Compile user-facing output.
+        # The CRITIC agent produces internal quality feedback meant to drive
+        # refinement — it must not appear in the response shown to the user.
+        # Each successful processor result is a dict with an "output" key;
+        # fall back to str() for any non-standard processor shape.
         output_parts = []
         for result in workflow_result["results"]:
-            if result["success"] and result.get("result"):
-                output_parts.append(str(result["result"]))
-        
+            if not result["success"]:
+                continue
+            agent_result = result.get("result")
+            if not agent_result:
+                continue
+            # Skip critic — internal feedback only
+            if isinstance(agent_result, dict):
+                if agent_result.get("role") == AgentRole.CRITIC.value:
+                    continue
+                output_parts.append(agent_result.get("output", str(agent_result)))
+            else:
+                output_parts.append(str(agent_result))
+
         output = "\n\n".join(output_parts) if output_parts else "Task processing completed"
-        
+
         return {
             "output": output,
             "subtasks_completed": workflow_result["completed"],
@@ -649,21 +685,18 @@ class BrainLikeAI:
         """
         Build a list of seed queries for the swarm warm-up.
 
-        The returned list is a blend of two query pools:
+        The returned list blends two pools:
 
         * **KB-derived queries** (~75 % of target_count) — short phrases built
-          from the top keywords extracted from a sample of KB chunks.  These
-          keep personas competitive on the user's actual knowledge domain.
+          from top keywords extracted from KB chunks.  These keep personas
+          relevant for the user's actual knowledge domain.
 
-        * **General queries** (~25 % of target_count, minimum 5) — diverse,
-          domain-agnostic probes drawn from ``_GENERAL_WARMUP_QUERIES``.
-          These apply evolutionary pressure against over-specialisation: a
-          persona whose reformulation strategy only works on KB-specific topics
-          will score lower on these, so generalist strategies retain a fitness
-          advantage.
-
-        The two pools are shuffled together before returning so the queries
-        interleave throughout the warmup session rather than clustering.
+        * **General queries** (~25 % of target_count, minimum 5) — drawn from
+          ``_GENERAL_WARMUP_QUERIES``.  These add query variety and can surface
+          KB content that topic-specific keywords miss.  They do not directly
+          provide anti-specialisation selection pressure (all personas score zero
+          on queries with no KB match); that is handled in the evolution layer
+          via diversity penalties and strategy revival in _run_competition().
 
         Falls back to a built-in list of generic KB probes when the KB is empty.
         """

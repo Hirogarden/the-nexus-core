@@ -17,6 +17,7 @@ Requires:
 import json
 import logging
 import shutil
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _brain: Optional[BrainLikeAI] = None
+# Serialises session creation so concurrent /sessions/new calls don't each
+# spin up their own BrainLikeAI (which initialises disk structures) and race
+# to assign the result to the global.
+_brain_lock: threading.Lock = threading.Lock()
 
 
 @asynccontextmanager
@@ -171,7 +176,11 @@ async def new_session():
     session ID and cleared short-term memory. Long-term memory is preserved.
     """
     global _brain
-    _brain = BrainLikeAI()
+    # Build outside the lock so construction time doesn't block health checks.
+    # Assign under the lock to serialise concurrent callers.
+    new_brain = BrainLikeAI()
+    with _brain_lock:
+        _brain = new_brain
     return {
         "session_id": _brain.session_id,
         "message": "New session started",

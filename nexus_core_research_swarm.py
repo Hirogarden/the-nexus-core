@@ -126,6 +126,12 @@ _STRATEGY_VOCAB: Dict[str, Dict[str, List[str]]] = {
 
 _STRATEGIES = list(_STRATEGY_VOCAB.keys())
 
+# EMA decay factor for fitness tracking.
+# Each new search sample gets this weight; prior history gets (1 - _EMA_ALPHA).
+# 0.15 means ~15 % of weight on the newest result, letting fitness adapt to
+# environmental changes in roughly 10-20 searches rather than hundreds.
+_EMA_ALPHA: float = 0.15
+
 # Default seed personas — one per strategy except comparative (seeded later)
 _SEED_PERSONAS = [
     ("Technical Analyst",    "technical"),
@@ -251,13 +257,19 @@ class ResearchPersona:
         return " ".join(parts)
 
     def record_search(self, hit: bool) -> None:
-        """Update fitness after one search."""
+        """Update fitness after one search using an exponential moving average.
+
+        EMA adapts ~10–20× faster than a running average when the query
+        distribution or KB content changes, because recent samples always
+        carry a fixed weight (_EMA_ALPHA) rather than diminishing 1/n weight.
+        """
         self.search_count += 1
         if hit:
             self.hit_count += 1
-        n = self.search_count
         new_sample = 1.0 if hit else 0.0
-        self.fitness = round((self.fitness * (n - 1) + new_sample) / n, 4)
+        self.fitness = round(
+            _EMA_ALPHA * new_sample + (1.0 - _EMA_ALPHA) * self.fitness, 4
+        )
 
     # ----- Serialisation ----------------------------------------------------
 
@@ -393,7 +405,7 @@ class ResearchSwarm:
         data_dir: Optional[str] = None,
         max_active: int = 5,
         competition_interval: int = 20,
-        min_samples_to_compete: int = 5,
+        min_samples_to_compete: int = 20,
     ):
         base = Path(data_dir) if data_dir else Path(_config.nexus_data_path)
         self._dir = base / self._SWARM_DIR
@@ -405,6 +417,11 @@ class ResearchSwarm:
         self.max_active            = max_active
         self.competition_interval  = competition_interval
         self.min_samples_to_compete = min_samples_to_compete
+
+        # Re-entrant lock protecting all file read-modify-write sequences.
+        # RLock (not Lock) is used so that search() can call _run_competition()
+        # while already holding the lock without deadlocking.
+        self._lock: threading.RLock = threading.RLock()
 
         # Running counter of total individual-persona searches since last
         # evolution trigger.
@@ -513,6 +530,14 @@ class ResearchSwarm:
 
         Persona fitness is updated in-place and the full list is persisted.
 
+        Thread safety
+        -------------
+        KB searches are performed outside the internal lock (they can be slow
+        network or disk calls and should not block concurrent threads).  The
+        subsequent fitness update and file write are performed under
+        ``self._lock`` (a re-entrant lock) so that concurrent calls from the
+        warmup thread and the API request thread cannot corrupt the JSONL file.
+
         Parameters
         ----------
         query
@@ -539,6 +564,7 @@ class ResearchSwarm:
         # Spread the per-persona budget; give each at least 3 results
         per_k = max(3, (top_k * 2) // len(active))
 
+        # --- KB searches: performed OUTSIDE the lock (slow I/O) ----------
         # chunk_id/text-hash → (chunk_dict, contributing_persona_ids)
         seen:         Dict[str, Dict[str, Any]] = {}
         contributors: Dict[str, List[str]]      = defaultdict(list)
@@ -562,46 +588,40 @@ class ResearchSwarm:
                         seen[key] = chunk
                 contributors[key].append(persona.persona_id)
 
-        # Determine hit/miss per persona
-        all_keys        = set(seen.keys())
-        persona_hit_ids = {
-            pid
-            for key, pids in contributors.items()
-            for pid in pids
-            if key in all_keys
-        }
-        # A persona "hit" if at least one of its chunks makes the merged pool
-        hit_ids = set()
+        # Determine which chunks actually make the final top_k
         if seen:
-            # Take top_k by score to identify which chunks actually made it
-            ranked = sorted(seen.values(), key=lambda c: c.get("score", 0.0), reverse=True)
-            final  = ranked[:top_k]
+            ranked    = sorted(seen.values(), key=lambda c: c.get("score", 0.0), reverse=True)
+            final     = ranked[:top_k]
             final_keys = {
                 c.get("chunk_id") or _text_hash(c.get("text", ""))
                 for c in final
             }
-            for key in final_keys:
-                for pid in contributors.get(key, []):
-                    hit_ids.add(pid)
+            hit_ids = {
+                pid
+                for key in final_keys
+                for pid in contributors.get(key, [])
+            }
         else:
-            final = []
+            final   = []
+            hit_ids = set()
 
-        # Update fitness on all personas and persist
-        all_personas = self._load_all()
-        by_id = {p.persona_id: p for p in all_personas}
-        for persona in active:
-            if persona.persona_id in by_id:
-                by_id[persona.persona_id].record_search(
-                    hit=persona.persona_id in hit_ids
-                )
-                self._searches_since_evolve += 1
+        # --- Fitness update + persistence: under the lock ----------------
+        with self._lock:
+            all_personas = self._load_all()
+            by_id = {p.persona_id: p for p in all_personas}
+            for persona in active:
+                if persona.persona_id in by_id:
+                    by_id[persona.persona_id].record_search(
+                        hit=persona.persona_id in hit_ids
+                    )
+                    self._searches_since_evolve += 1
 
-        self._save_all(list(by_id.values()))
+            self._save_all(list(by_id.values()))
 
-        # Maybe trigger an evolution round
-        if self._searches_since_evolve >= self.competition_interval:
-            self._searches_since_evolve = 0
-            self._run_competition()
+            # Maybe trigger an evolution round (RLock allows re-entry)
+            if self._searches_since_evolve >= self.competition_interval:
+                self._searches_since_evolve = 0
+                self._run_competition()
 
         return final
 
@@ -612,54 +632,118 @@ class ResearchSwarm:
     def _run_competition(self) -> Optional[str]:
         """
         Replace the weakest active persona (if it has enough samples) with a
-        challenger bred from the strongest active persona.
+        challenger bred from the active pool.
+
+        Improvements over naïve "eliminate weakest, clone strongest":
+
+        Diversity-aware elimination
+            Personas whose strategy is over-represented face extra elimination
+            pressure (up to 0.15 fitness penalty per density unit), so a
+            dominant strategy can't simply crowd out all others through luck.
+
+        Probabilistic parent selection
+            80 % of the time the challenger is bred from the strongest persona
+            (exploitation); 20 % of the time from a random active persona
+            (exploration), preventing the gene pool from converging to a single
+            lineage within a few dozen generations.
+
+        Periodic strategy revival
+            Every 5 competition rounds, if any of the 7 strategy types is
+            absent from the active pool, a fresh seed persona for that strategy
+            is injected as the challenger.  This ensures lost strategies can
+            always re-enter competition.
 
         Returns the new challenger's persona_id, or None if no elimination
         happened (all personas still have too few samples).
+
+        Thread safety: wraps the entire read-modify-write section in
+        ``self._lock``.  When called from ``search()`` (which already holds
+        the RLock), re-entry is safe.
         """
-        all_personas = self._load_all()
-        by_id        = {p.persona_id: p for p in all_personas}
-        active_ids   = self._load_active_ids()
-        active       = [by_id[pid] for pid in active_ids if pid in by_id]
+        with self._lock:
+            all_personas = self._load_all()
+            by_id        = {p.persona_id: p for p in all_personas}
+            active_ids   = self._load_active_ids()
+            active       = [by_id[pid] for pid in active_ids if pid in by_id]
 
-        if not active:
-            return None
+            if not active:
+                return None
 
-        # Need at least one persona with enough samples to eliminate
-        eligible = [
-            p for p in active
-            if p.search_count >= self.min_samples_to_compete
-        ]
-        if not eligible:
-            return None
+            # Need at least one persona with enough samples to eliminate
+            eligible = [
+                p for p in active
+                if p.search_count >= self.min_samples_to_compete
+            ]
+            if not eligible:
+                return None
 
-        # Identify the weakest (lowest fitness among eligible)
-        weakest = min(eligible, key=lambda p: p.fitness)
+            # --- Diversity-aware weakest selection -----------------------
+            # Penalise personas whose strategy dominates the active pool so
+            # that a flood of one strategy type doesn't become unassailable.
+            strategy_counts: Dict[str, int] = defaultdict(int)
+            for p in active:
+                strategy_counts[p.strategy] += 1
+            n_active = len(active)
 
-        # Breed a challenger from the strongest active persona
-        strongest = max(active, key=lambda p: p.fitness)
-        challenger = mutate_persona(strongest)
+            def _elimination_score(p: "ResearchPersona") -> float:
+                density = strategy_counts[p.strategy] / n_active
+                # Penalty: up to 0.15 for a fully dominant strategy (all same)
+                return p.fitness - 0.15 * density
 
-        # Eliminate the weakest; insert challenger
-        by_id[weakest.persona_id].active = False
-        by_id[challenger.persona_id] = challenger
+            weakest = min(eligible, key=_elimination_score)
 
-        new_active_ids = [
-            pid for pid in active_ids if pid != weakest.persona_id
-        ]
-        new_active_ids.append(challenger.persona_id)
+            # --- Probabilistic parent selection ---------------------------
+            # 80 % exploitation (breed from strongest) to capitalise on good
+            # genes; 20 % exploration (breed from random) to maintain lineage
+            # diversity and prevent convergence to one ancestral line.
+            if random.random() < 0.20:
+                parent = random.choice(active)
+            else:
+                parent = max(active, key=lambda p: p.fitness)
 
-        self._save_all(list(by_id.values()))
-        self._save_active_ids(new_active_ids)
+            challenger = mutate_persona(parent)
 
-        self._evolution_count += 1
-        print(
-            f"[swarm] Evolution: eliminated '{weakest.name}' "
-            f"(fitness={weakest.fitness:.3f} over {weakest.search_count} searches) "
-            f"→ challenger '{challenger.name}' "
-            f"(gen {challenger.generation}, parent='{strongest.name}')"
-        )
-        return challenger.persona_id
+            # --- Periodic strategy revival --------------------------------
+            # Every 5 rounds, re-introduce a strategy type that has been
+            # completely eliminated from the active pool.
+            remaining_strategies = {
+                p.strategy for p in active
+                if p.persona_id != weakest.persona_id
+            }
+            remaining_strategies.add(challenger.strategy)
+            missing_strategies = [s for s in _STRATEGIES if s not in remaining_strategies]
+
+            if self._evolution_count % 5 == 0 and missing_strategies:
+                revival_strategy = random.choice(missing_strategies)
+                challenger = _seed_persona(
+                    f"{revival_strategy.title()} Revival",
+                    revival_strategy,
+                    generation=challenger.generation,
+                    parent_id=None,   # genuinely fresh genes, not a descendant
+                )
+                print(f"[swarm] Diversity revival: reintroducing '{revival_strategy}' strategy")
+
+            # --- Apply elimination + insertion ----------------------------
+            by_id[weakest.persona_id].active = False
+            by_id[challenger.persona_id] = challenger
+
+            new_active_ids = [
+                pid for pid in active_ids if pid != weakest.persona_id
+            ]
+            new_active_ids.append(challenger.persona_id)
+
+            self._save_all(list(by_id.values()))
+            self._save_active_ids(new_active_ids)
+
+            self._evolution_count += 1
+            print(
+                f"[swarm] Evolution #{self._evolution_count}: "
+                f"eliminated '{weakest.name}' "
+                f"(fitness={weakest.fitness:.3f}, {weakest.search_count} searches) "
+                f"→ '{challenger.name}' "
+                f"(gen {challenger.generation}, parent='{parent.name}')"
+            )
+            return challenger.persona_id
 
     def force_evolve(self) -> Dict[str, Any]:
         """
@@ -707,12 +791,11 @@ class ResearchSwarm:
         * *stop_event* is set by the caller             → stop_reason "stopped_by_user"
         * *queries* is empty                            → stop_reason "no_queries"
 
-        Note on thread safety
-        ---------------------
-        This method writes to shared JSONL files.  In the expected use case
-        (user steps away, warmup runs solo) concurrent writes are extremely
-        unlikely.  If you need concurrent query processing and warmup, add an
-        external lock around ``search()`` calls.
+        Thread safety
+        -------------
+        ``search()`` now acquires an internal RLock for its read-modify-write
+        disk section, so this method is safe to run concurrently with normal
+        API request handling.
         """
         state = self._warmup_state
         state.running              = True
