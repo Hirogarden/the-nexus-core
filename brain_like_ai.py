@@ -45,6 +45,54 @@ _AGENT_SYSTEM_PROMPTS = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# General-purpose warmup queries (domain-agnostic)
+#
+# These are intentionally unrelated to any specific knowledge base so that
+# swarm personas are evaluated on *breadth*, not just on the KB's own topics.
+# Mixing them into the warmup seed pool prevents over-specialisation: a persona
+# strategy that can only reformulate narrow KB queries will score lower on
+# these, giving generalist strategies a competitive pressure to survive.
+# ---------------------------------------------------------------------------
+_GENERAL_WARMUP_QUERIES: List[str] = [
+    # Conceptual / definitional
+    "what is the difference between correlation and causation",
+    "explain the concept of emergence in complex systems",
+    "what is entropy and why does it matter",
+    "define heuristic and give an example",
+    "what is the Pareto principle",
+    # How-to / practical
+    "how do you debug a problem you do not fully understand",
+    "how to structure an argument clearly",
+    "how does peer review work",
+    "how to evaluate the credibility of a source",
+    "how do you break a large problem into smaller parts",
+    # Comparative
+    "compare deductive and inductive reasoning",
+    "difference between efficiency and effectiveness",
+    "analogy versus metaphor what is the distinction",
+    "what are the trade-offs between speed and accuracy",
+    "compare short-term and long-term thinking",
+    # Broad knowledge
+    "what causes economic inflation",
+    "how does the scientific method work",
+    "what is the role of feedback in learning",
+    "why do systems fail unexpectedly",
+    "what are the stages of a typical project lifecycle",
+    # Critical / skeptical
+    "what are common logical fallacies",
+    "how can data be misleading",
+    "what are the limits of expert opinion",
+    "when is simplicity better than complexity",
+    "what can go wrong with prediction models",
+    # Creative / open-ended
+    "describe an unexpected use for a common tool",
+    "what would an ideal knowledge management system look like",
+    "how might this topic look different in twenty years",
+    "what questions are still unanswered in this domain",
+    "what does success look like and how would you measure it",
+]
+
 # Import existing Nexus Core components
 try:
     from nexus_core_engine import NexusCoreEngine
@@ -601,12 +649,32 @@ class BrainLikeAI:
         """
         Build a list of seed queries for the swarm warm-up.
 
-        Extracts the top keywords from a sample of KB chunks and turns them
-        into short query phrases (e.g. "what is {kw}", "{kw} overview").
-        Falls back to a built-in list of generic probes when the KB is empty.
+        The returned list is a blend of two query pools:
+
+        * **KB-derived queries** (~75 % of target_count) — short phrases built
+          from the top keywords extracted from a sample of KB chunks.  These
+          keep personas competitive on the user's actual knowledge domain.
+
+        * **General queries** (~25 % of target_count, minimum 5) — diverse,
+          domain-agnostic probes drawn from ``_GENERAL_WARMUP_QUERIES``.
+          These apply evolutionary pressure against over-specialisation: a
+          persona whose reformulation strategy only works on KB-specific topics
+          will score lower on these, so generalist strategies retain a fitness
+          advantage.
+
+        The two pools are shuffled together before returning so the queries
+        interleave throughout the warmup session rather than clustering.
+
+        Falls back to a built-in list of generic KB probes when the KB is empty.
         """
+        import random as _random
         from nexus_core_hirag import _top_keywords
 
+        # How many slots to reserve for general queries (at least 5, ~25 %)
+        general_share = max(5, target_count // 4)
+        kb_share      = target_count - general_share
+
+        # --- KB-derived queries -------------------------------------------
         keywords: List[str] = []
         try:
             sample = _search_kb(
@@ -620,7 +688,7 @@ class BrainLikeAI:
         except Exception:
             pass
 
-        queries: List[str] = []
+        kb_queries: List[str] = []
         templates = [
             "{kw}",
             "what is {kw}",
@@ -630,15 +698,15 @@ class BrainLikeAI:
         ]
         for kw in keywords:
             for tmpl in templates:
-                queries.append(tmpl.format(kw=kw))
-                if len(queries) >= target_count:
+                kb_queries.append(tmpl.format(kw=kw))
+                if len(kb_queries) >= kb_share:
                     break
-            if len(queries) >= target_count:
+            if len(kb_queries) >= kb_share:
                 break
 
-        # Fallback if KB is empty or has too few keywords
-        if len(queries) < 10:
-            queries += [
+        # Fallback KB probes when the knowledge base is empty / sparse
+        if len(kb_queries) < 5:
+            kb_queries += [
                 "overview of main topics",
                 "key concepts and definitions",
                 "how does this work",
@@ -653,7 +721,25 @@ class BrainLikeAI:
                 "common problems and solutions",
             ]
 
-        return queries[:target_count]
+        kb_queries = kb_queries[:kb_share]
+
+        # --- General queries (anti-specialisation) ------------------------
+        general_pool  = list(_GENERAL_WARMUP_QUERIES)
+        _random.shuffle(general_pool)
+        general_queries = general_pool[:general_share]
+
+        # Pad with extra general queries if the KB pool came up short
+        # (happens when KB is sparse and the fallback list < kb_share)
+        shortfall = target_count - len(kb_queries) - len(general_queries)
+        if shortfall > 0:
+            already_chosen = set(general_queries)
+            extras = [q for q in general_pool if q not in already_chosen]
+            general_queries = general_queries + extras[:shortfall]
+
+        # --- Blend and shuffle -------------------------------------------
+        combined = kb_queries + general_queries
+        _random.shuffle(combined)
+        return combined[:target_count]
 
     def start_swarm_warmup(
         self,
