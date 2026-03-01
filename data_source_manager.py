@@ -3,6 +3,7 @@ The Nexus Core - External Data Source Manager
 Handles USB drives and network sources with HIPAA compliance.
 """
 
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import json
@@ -423,10 +424,6 @@ class DataSourceManager:
         logs.sort(key=lambda x: x["timestamp"])
         
         return logs
-
-
-# Windows compatibility
-import os
 
 
 if __name__ == "__main__":

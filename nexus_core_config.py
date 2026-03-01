@@ -16,6 +16,7 @@ To reload config (e.g. in tests):
     my_config = load_config("/path/to/custom.env")
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -239,3 +240,26 @@ def load_config(env_file: Optional[str] = None) -> NexusConfig:
 # ---------------------------------------------------------------------------
 
 config: NexusConfig = load_config()
+
+
+# ---------------------------------------------------------------------------
+# Logging setup  (runs once when this module is first imported)
+# ---------------------------------------------------------------------------
+
+def configure_logging(cfg: NexusConfig = config) -> None:
+    """
+    Apply cfg.log_level to the root Python logger.
+
+    Called automatically when this module is imported.  Can be called again
+    after load_config() in tests or scripts that need a custom level.
+    """
+    level = getattr(logging, cfg.log_level, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,   # override any handlers already attached (e.g. by uvicorn)
+    )
+
+
+configure_logging()

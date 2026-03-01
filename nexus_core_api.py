@@ -15,6 +15,7 @@ Requires:
 """
 
 import json
+import logging
 import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -30,6 +31,8 @@ from brain_like_ai import BrainLikeAI
 from nexus_core_ingestion import ingest_file, get_knowledge_base_stats
 from nexus_core_genome import evolve as _genome_evolve
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # App lifecycle
@@ -42,8 +45,11 @@ _brain: Optional[BrainLikeAI] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _brain
+    logger.info("Starting Nexus Core API (provider=%s)", config.llm_provider)
     _brain = BrainLikeAI()
+    logger.info("BrainLikeAI ready — session %s", _brain.session_id)
     yield
+    logger.info("Shutting down Nexus Core API")
     _brain = None
 
 
