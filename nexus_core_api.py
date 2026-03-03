@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from nexus_core_config import config
 from brain_like_ai import BrainLikeAI
-from nexus_core_ingestion import ingest_file, get_knowledge_base_stats
+from nexus_core_ingestion import ingest_file, get_knowledge_base_stats, _get_embedding_cache, ChunkStore
 from nexus_core_genome import evolve as _genome_evolve
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,22 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Nexus Core API (provider=%s)", config.llm_provider)
     _brain = BrainLikeAI()
     logger.info("BrainLikeAI ready — session %s", _brain.session_id)
+
+    # Pre-warm the embedding cache in the background so the first query
+    # doesn't block on building/loading a large embedding matrix.
+    def _prewarm_embeddings():
+        try:
+            kb_dir = Path(config.nexus_data_path) / "knowledge_base"
+            store = ChunkStore(kb_dir)
+            if store.chunks_file.exists():
+                logger.info("Pre-warming embedding cache …")
+                _get_embedding_cache(store)
+                logger.info("Embedding cache ready")
+        except Exception as exc:
+            logger.warning("Embedding cache pre-warm failed: %s", exc)
+
+    threading.Thread(target=_prewarm_embeddings, daemon=True, name="emb-prewarm").start()
+
     yield
     logger.info("Shutting down Nexus Core API")
     _brain = None

@@ -15,9 +15,10 @@ Usage:
 import hashlib
 import json
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from nexus_core_config import config as _config
 
@@ -44,6 +45,23 @@ try:
     print(f"[ingestion] Vector search enabled — model: {_EMBEDDING_MODEL_NAME} | device: {_DEVICE} ({_gpu_name})")
 except Exception as _e:
     print(f"[ingestion] Vector search unavailable, using keyword fallback ({_e})")
+
+
+# ---------------------------------------------------------------------------
+# Embedding cache — built once at ingestion time, reused on every search.
+#
+# Without this, search_knowledge_base() re-encodes every chunk on every call.
+# For 44,500 chunks that is ~68 MB of float32 embeddings computed from scratch
+# on each of the 5 swarm persona searches — enough to hang or crash the server.
+#
+# The fix: persist the embedding matrix to disk at ingest time and load it
+# into memory on first search.  Subsequent searches only embed the query
+# (1 vector) and multiply against the cached matrix with numpy.
+# ---------------------------------------------------------------------------
+_emb_lock: threading.Lock = threading.Lock()
+_emb_matrix: Optional[Any] = None          # numpy float32 (n, 384) or None
+_emb_chunk_ids: List[str] = []             # chunk_id[i] matches row i of matrix
+_emb_kb_dir: Optional[Path] = None        # tracks which kb_dir is cached
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +224,8 @@ class ChunkStore:
         self.kb_dir.mkdir(parents=True, exist_ok=True)
         self.chunks_file = self.kb_dir / "chunks.jsonl"
         self.registry_file = self.kb_dir / "ingested_files.json"
+        self.embeddings_file = self.kb_dir / "embeddings.npy"
+        self.embedding_ids_file = self.kb_dir / "embedding_ids.txt"
         self._registry: Dict[str, Any] = self._load_registry()
 
     # -- registry (which files have been ingested) ---------------------------
@@ -263,6 +283,28 @@ class ChunkStore:
                         pass
         return chunks
 
+    def load_chunks_by_ids(self, ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Load only the chunks matching a set of chunk_ids (single JSONL scan)."""
+        if not self.chunks_file.exists() or not ids:
+            return {}
+        wanted = set(ids)
+        result: Dict[str, Dict[str, Any]] = {}
+        with self.chunks_file.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                    cid = chunk.get("chunk_id", "")
+                    if cid in wanted:
+                        result[cid] = chunk
+                        if len(result) == len(wanted):
+                            break  # found all — stop early
+                except json.JSONDecodeError:
+                    pass
+        return result
+
     def chunk_count(self) -> int:
         if not self.chunks_file.exists():
             return 0
@@ -294,12 +336,107 @@ def _keyword_score(query: str, chunk_text: str) -> float:
     return 0.7 * coverage + 0.3 * density
 
 
+def _get_embedding_cache(store: "ChunkStore") -> Tuple[Any, List[str]]:
+    """Return (matrix, chunk_ids) from the in-memory cache, loading from disk
+    or rebuilding from scratch if the cache is cold or stale.
+
+    Thread-safe: uses _emb_lock so concurrent swarm searches don't race.
+    Returns (None, []) if vector search is unavailable.
+    """
+    global _emb_matrix, _emb_chunk_ids, _emb_kb_dir
+
+    if not _VECTOR_SEARCH_AVAILABLE or _np is None:
+        return None, []
+
+    with _emb_lock:
+        # Cache hit: same kb_dir and non-empty
+        if (
+            _emb_matrix is not None
+            and _emb_kb_dir == store.kb_dir
+            and len(_emb_chunk_ids) > 0
+        ):
+            return _emb_matrix, _emb_chunk_ids
+
+        # Try loading from persisted files
+        if store.embeddings_file.exists() and store.embedding_ids_file.exists():
+            try:
+                matrix = _np.load(str(store.embeddings_file))
+                ids = store.embedding_ids_file.read_text(encoding="utf-8").splitlines()
+                ids = [i for i in ids if i]   # strip blank lines
+                if len(ids) == matrix.shape[0]:
+                    _emb_matrix = matrix
+                    _emb_chunk_ids = ids
+                    _emb_kb_dir = store.kb_dir
+                    print(f"[ingestion] Loaded embedding cache: {len(ids)} chunks from disk")
+                    return _emb_matrix, _emb_chunk_ids
+            except Exception as exc:
+                print(f"[ingestion] Embedding cache load failed ({exc}), rebuilding …")
+
+        # Cold start or corrupted: build from all chunks
+        chunks = store.load_all_chunks()
+        if not chunks:
+            _emb_matrix = _np.zeros((0, 384), dtype="float32")
+            _emb_chunk_ids = []
+            _emb_kb_dir = store.kb_dir
+            return _emb_matrix, _emb_chunk_ids
+
+        texts = [c["text"] for c in chunks]
+        ids = [c["chunk_id"] for c in chunks]
+        print(f"[ingestion] Building embedding cache for {len(chunks)} chunks …")
+        matrix = _EMBEDDING_MODEL.encode(
+            texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False
+        )
+        _emb_matrix = _np.array(matrix, dtype="float32")
+        _emb_chunk_ids = ids
+        _emb_kb_dir = store.kb_dir
+        # Persist so the next server restart doesn't rebuild
+        _np.save(str(store.embeddings_file), _emb_matrix)
+        store.embedding_ids_file.write_text("\n".join(ids), encoding="utf-8")
+        print(f"[ingestion] Embedding cache built and saved ({len(ids)} chunks)")
+        return _emb_matrix, _emb_chunk_ids
+
+
+def _append_embedding_cache(
+    store: "ChunkStore", chunk_ids: List[str], texts: List[str]
+) -> None:
+    """Extend the in-memory and on-disk embedding cache with newly ingested chunks.
+
+    Called by ingest_file() immediately after chunk_records are persisted so
+    the cache stays current without a full rebuild.
+    """
+    global _emb_matrix, _emb_chunk_ids, _emb_kb_dir
+
+    if not _VECTOR_SEARCH_AVAILABLE or _np is None or not chunk_ids:
+        return
+
+    with _emb_lock:
+        new_embs = _EMBEDDING_MODEL.encode(
+            texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False
+        )
+        new_embs = _np.array(new_embs, dtype="float32")
+
+        if _emb_matrix is None or _emb_kb_dir != store.kb_dir or _emb_matrix.shape[0] == 0:
+            _emb_matrix = new_embs
+            _emb_chunk_ids = list(chunk_ids)
+        else:
+            _emb_matrix = _np.vstack([_emb_matrix, new_embs])
+            _emb_chunk_ids.extend(chunk_ids)
+        _emb_kb_dir = store.kb_dir
+
+        # Persist updated matrix and id list
+        _np.save(str(store.embeddings_file), _emb_matrix)
+        with store.embedding_ids_file.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(chunk_ids) + "\n")
+
+
 def _vector_score(query: str, chunks: List[Dict[str, Any]]) -> List[float]:
-    """Vector cosine similarity scores (requires sentence-transformers)."""
+    """Vector cosine similarity scores (requires sentence-transformers).
+    Kept for backward compatibility with search_chunks(); not used by the
+    optimised search_knowledge_base() path.
+    """
     if not _VECTOR_SEARCH_AVAILABLE or not chunks:
         return [0.0] * len(chunks)
     texts = [c["text"] for c in chunks]
-    # batch_size=32 keeps VRAM usage low; normalize gives cosine similarity via dot product
     q_emb = _EMBEDDING_MODEL.encode([query], normalize_embeddings=True, batch_size=1)
     c_emb = _EMBEDDING_MODEL.encode(texts, normalize_embeddings=True, batch_size=32)
     scores = (q_emb @ c_emb.T)[0].tolist()
@@ -432,6 +569,13 @@ def ingest_file(
     store.append_chunks(chunk_records)
     store.mark_ingested(file_path.name, content_hash, len(chunk_records))
 
+    # Pre-compute and cache embeddings so search never has to re-encode chunks
+    _append_embedding_cache(
+        store,
+        chunk_ids=[c["chunk_id"] for c in chunk_records],
+        texts=[c["text"] for c in chunk_records],
+    )
+
     return {
         "status": "ok",
         "filename": file_path.name,
@@ -448,21 +592,12 @@ def search_knowledge_base(
     """
     Search the knowledge base for chunks relevant to a query.
 
-    Args:
-        query: The search query
-        data_dir: Root data directory (defaults to config.nexus_data_path)
-        top_k: Number of results (defaults to config.search_top_k)
+    Uses a pre-computed embedding cache so only the query needs to be encoded
+    at search time — not all chunks.  For large KBs (tens of thousands of
+    chunks) this is orders of magnitude faster than the naïve approach of
+    re-encoding all chunks on every call.
 
-    Returns:
-        List of chunk dicts ordered by relevance, each containing:
-        {
-            "chunk_id": "...",
-            "source_file": "document.txt",
-            "chunk_index": 0,
-            "text": "...",
-            "score": 0.82,
-            ...
-        }
+    Falls back to keyword scoring when sentence-transformers is unavailable.
     """
     if data_dir is None:
         data_dir = _config.nexus_data_path
@@ -471,11 +606,54 @@ def search_knowledge_base(
 
     kb_dir = Path(data_dir) / "knowledge_base"
     store = ChunkStore(kb_dir)
-    chunks = store.load_all_chunks()
 
+    # --- Fast vector path (sentence-transformers available) ------------------
+    if _VECTOR_SEARCH_AVAILABLE and _np is not None:
+        matrix, cache_ids = _get_embedding_cache(store)
+
+        if matrix is not None and len(cache_ids) > 0:
+            # Encode only the query (1 vector, not all chunks)
+            q_emb = _EMBEDDING_MODEL.encode(
+                [query], normalize_embeddings=True, batch_size=1
+            )
+            q_vec = _np.array(q_emb[0], dtype="float32")
+
+            # Dot product against the full matrix: shape (n,)
+            scores = matrix @ q_vec
+
+            # Pick top_k * 3 candidates for diversity filtering
+            fetch_k = min(top_k * 3, len(cache_ids))
+            top_idx = _np.argpartition(scores, -fetch_k)[-fetch_k:]
+            top_idx = top_idx[_np.argsort(scores[top_idx])[::-1]]
+
+            candidate_ids = [cache_ids[i] for i in top_idx]
+            candidate_scores = {cache_ids[i]: float(scores[i]) for i in top_idx}
+
+            # Load only the candidate chunks from disk (avoids full 44k+ load)
+            id_to_chunk = store.load_chunks_by_ids(candidate_ids)
+
+            results: List[Dict[str, Any]] = []
+            seen_sources: Dict[str, int] = {}
+            for cid in candidate_ids:
+                score = candidate_scores[cid]
+                if score <= 0.0:
+                    continue
+                chunk = id_to_chunk.get(cid)
+                if not chunk:
+                    continue
+                src = chunk["source_file"]
+                seen_sources[src] = seen_sources.get(src, 0) + 1
+                if seen_sources[src] > 2:
+                    continue
+                results.append({**chunk, "score": round(score, 4)})
+                if len(results) >= top_k:
+                    break
+            return results
+
+    # --- Keyword fallback ----------------------------------------------------
+    chunks = store.load_all_chunks()
     if not chunks:
         return []
-
     return search_chunks(query, chunks, top_k=top_k)
 
 
