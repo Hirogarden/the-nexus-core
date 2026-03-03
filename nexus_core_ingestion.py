@@ -12,6 +12,7 @@ Usage:
     chunks = search_knowledge_base("my query", top_k=5)
 """
 
+import csv
 import hashlib
 import json
 import re
@@ -194,6 +195,43 @@ def read_file(file_path: Path) -> Optional[str]:
         return None
 
     return None
+
+
+def _read_csv_rows(file_path: Path) -> Optional[List[str]]:
+    """Parse a CSV file and return one text string per data row.
+
+    Each row becomes: "Column1: value1. Column2: value2. Column3: value3."
+    Empty values and the header row are skipped.  This keeps all facts
+    about one record together in a single chunk so the LLM can answer
+    questions like "what is the common name of X" without needing to
+    cross-reference separate chunks.
+
+    Returns None if the file is not a valid tabular CSV (e.g. a flat
+    log export with no headers), in which case callers should fall back
+    to read_file() + chunk_text().
+    """
+    try:
+        raw = file_path.read_text(encoding="utf-8", errors="replace")
+        reader = csv.DictReader(raw.splitlines())
+        headers = reader.fieldnames
+        if not headers or len(headers) < 2:
+            return None   # Not a tabular CSV — use plain text fallback
+
+        rows: List[str] = []
+        for row in reader:
+            # Build "Field: value. Field: value." string for the row
+            parts = []
+            for col in headers:
+                val = (row.get(col) or "").strip()
+                col_clean = col.strip()
+                if val and col_clean:
+                    parts.append(f"{col_clean}: {val}")
+            if parts:
+                rows.append(". ".join(parts) + ".")
+        return rows if rows else None
+    except Exception as exc:
+        print(f"[ingestion] CSV row parse failed for {file_path.name}: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -529,13 +567,35 @@ def ingest_file(
         return {"status": "skipped", "filename": file_path.name, "chunks_created": 0,
                 "message": f"Unsupported extension: {file_path.suffix}"}
 
-    text = read_file(file_path)
-    if text is None or not text.strip():
+    # --- Read and chunk the file ---------------------------------------------
+    # CSV files get row-based chunking: one self-contained chunk per data row
+    # (Field: value. Field: value. …) so the LLM can answer record-level
+    # questions without needing to cross-reference split chunks.
+    # All other formats use the generic prose chunker.
+    raw_chunks: List[str] = []
+    text_for_hash: str = ""
+
+    if file_path.suffix.lower() == ".csv":
+        csv_rows = _read_csv_rows(file_path)
+        if csv_rows:
+            raw_chunks = csv_rows
+            text_for_hash = "\n".join(csv_rows[:100])  # hash on first 100 rows
+        # If _read_csv_rows returns None, fall through to plain text below
+
+    if not raw_chunks:
+        text = read_file(file_path)
+        if text is None or not text.strip():
+            return {"status": "skipped", "filename": file_path.name, "chunks_created": 0,
+                    "message": "No extractable text"}
+        text_for_hash = text
+        raw_chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+
+    if not raw_chunks:
         return {"status": "skipped", "filename": file_path.name, "chunks_created": 0,
-                "message": "No extractable text"}
+                "message": "No chunks produced"}
 
     # --- Deduplication -------------------------------------------------------
-    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    content_hash = hashlib.sha256(text_for_hash.encode("utf-8")).hexdigest()[:16]
     if not force and store.is_ingested(content_hash):
         reg = store._registry[content_hash]
         return {
@@ -545,8 +605,7 @@ def ingest_file(
             "message": f"Already ingested ({reg['chunk_count']} chunks, {reg['ingested_at'][:10]})",
         }
 
-    # --- Chunk ---------------------------------------------------------------
-    raw_chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    # --- Build chunk records -------------------------------------------------
     now = datetime.now().isoformat()
     chunk_records = []
 
