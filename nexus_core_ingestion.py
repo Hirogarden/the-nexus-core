@@ -702,7 +702,15 @@ def search_knowledge_base(
                     continue
                 src = chunk["source_file"]
                 seen_sources[src] = seen_sources.get(src, 0) + 1
-                if seen_sources[src] > 2:
+                # Per-source cap prevents one long prose document from filling
+                # all results.  But for a single-source KB (e.g. one database
+                # CSV where every chunk is an independent record) the cap of 2
+                # would mean the LLM only ever sees 2 records per query.
+                # When there is only one distinct source seen so far, allow up
+                # to top_k results from it; cap at 2 per source once multiple
+                # sources are present.
+                per_source_cap = top_k if len(seen_sources) <= 1 else 2
+                if seen_sources[src] > per_source_cap:
                     continue
                 results.append({**chunk, "score": round(score, 4)})
                 if len(results) >= top_k:
