@@ -739,10 +739,21 @@ def search_knowledge_base(
                 dict.fromkeys(list(vec_scores) + [cid for cid in kw_scores if cid not in vec_scores])
             )
 
+            # Reverse index so keyword-only candidates can get their real
+            # vector score (scores[i]) rather than defaulting to 0.0.
+            # Without this a keyword hit ranked #160 in vector space gets
+            # 0.7×0.0 + 0.3×0.57 = 0.17 — worse than a pure-vector top-15
+            # entry with 0.7×0.46 + 0.3×0.0 = 0.32.
+            cache_id_to_idx: Dict[str, int] = {cid: i for i, cid in enumerate(cache_ids)}
+
             # Compute hybrid score for every candidate
             hybrid_scores: Dict[str, float] = {}
             for cid in all_candidate_ids:
-                v = vec_scores.get(cid, 0.0)
+                if cid in vec_scores:
+                    v = vec_scores[cid]
+                else:
+                    idx = cache_id_to_idx.get(cid, -1)
+                    v = float(scores[idx]) if idx >= 0 else 0.0
                 k = kw_scores.get(cid, 0.0)
                 hybrid_scores[cid] = _HYBRID_VECTOR_WEIGHT * v + _HYBRID_KEYWORD_WEIGHT * k
 
