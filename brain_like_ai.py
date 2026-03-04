@@ -545,7 +545,16 @@ class BrainLikeAI:
         if not sections:
             return query
 
-        return "\n\n".join(sections) + "\n\n---\n\nQUESTION: " + query
+        # Ground the LLM in the retrieved sources.  Without this, small models
+        # (e.g. llama3.2) often ignore context, hallucinate, or cross-reference
+        # data from different records when multiple similar entries are present.
+        grounding = (
+            "Instructions: Answer using ONLY the sources above. "
+            "Identify the record whose subject exactly matches the entity in the question. "
+            "Quote its field values directly — do not paraphrase, invent, or borrow values "
+            "from other records."
+        )
+        return "\n\n".join(sections) + "\n\n---\n\n" + grounding + "\n\nQUESTION: " + query
 
     def _process_direct(self, query: str, context: Dict[str, Any]) -> Dict[str, Any]:
         """Direct processing - single LLM call."""
