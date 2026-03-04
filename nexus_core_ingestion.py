@@ -374,6 +374,47 @@ def _keyword_score(query: str, chunk_text: str) -> float:
     return 0.7 * coverage + 0.3 * density
 
 
+# Weights for combining vector and keyword scores in hybrid search.
+# Vector dominates (semantic meaning) but keyword provides an exact-match
+# signal that saves cases like subspecies names that are near-identical in
+# embedding space to their parent species.
+_HYBRID_VECTOR_WEIGHT = 0.7
+_HYBRID_KEYWORD_WEIGHT = 0.3
+
+
+def _keyword_candidate_scores(
+    query: str, store: "ChunkStore", limit: int
+) -> Dict[str, float]:
+    """Scan the JSONL once and return {chunk_id: keyword_score} for the top
+    `limit` chunks by keyword overlap.
+
+    Used by the hybrid search path to find exact-term matches that vector
+    search may miss (e.g. subspecies names with near-identical embeddings to
+    the parent species).  Pure text scanning — no embeddings computed.
+    """
+    q_tokens = set(re.findall(r"\w+", query.lower()))
+    if not q_tokens or not store.chunks_file.exists():
+        return {}
+
+    scored: List[tuple] = []   # (score, chunk_id)
+    with store.chunks_file.open(encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            text = chunk.get("text", "")
+            score = _keyword_score(query, text)
+            if score > 0.0:
+                scored.append((score, chunk["chunk_id"]))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return {cid: s for s, cid in scored[:limit]}
+
+
 def _get_embedding_cache(store: "ChunkStore") -> Tuple[Any, List[str]]:
     """Return (matrix, chunk_ids) from the in-memory cache, loading from disk
     or rebuilding from scratch if the cache is cold or stale.
@@ -680,21 +721,41 @@ def search_knowledge_base(
             # Dot product against the full matrix: shape (n,)
             scores = matrix @ q_vec
 
-            # Pick top_k * 3 candidates for diversity filtering
+            # Pick top_k * 3 vector candidates
             fetch_k = min(top_k * 3, len(cache_ids))
             top_idx = _np.argpartition(scores, -fetch_k)[-fetch_k:]
             top_idx = top_idx[_np.argsort(scores[top_idx])[::-1]]
 
-            candidate_ids = [cache_ids[i] for i in top_idx]
-            candidate_scores = {cache_ids[i]: float(scores[i]) for i in top_idx}
+            vec_scores: Dict[str, float] = {cache_ids[i]: float(scores[i]) for i in top_idx}
+
+            # Hybrid: merge with keyword candidates so exact term matches
+            # (e.g. subspecies names) aren't buried by near-identical embeddings.
+            kw_scores: Dict[str, float] = _keyword_candidate_scores(
+                query, store, limit=top_k * 3
+            )
+
+            # Union of both candidate pools
+            all_candidate_ids: List[str] = list(
+                dict.fromkeys(list(vec_scores) + [cid for cid in kw_scores if cid not in vec_scores])
+            )
+
+            # Compute hybrid score for every candidate
+            hybrid_scores: Dict[str, float] = {}
+            for cid in all_candidate_ids:
+                v = vec_scores.get(cid, 0.0)
+                k = kw_scores.get(cid, 0.0)
+                hybrid_scores[cid] = _HYBRID_VECTOR_WEIGHT * v + _HYBRID_KEYWORD_WEIGHT * k
+
+            # Sort combined pool by hybrid score descending
+            all_candidate_ids.sort(key=lambda c: hybrid_scores[c], reverse=True)
 
             # Load only the candidate chunks from disk (avoids full 44k+ load)
-            id_to_chunk = store.load_chunks_by_ids(candidate_ids)
+            id_to_chunk = store.load_chunks_by_ids(all_candidate_ids)
 
             results: List[Dict[str, Any]] = []
             seen_sources: Dict[str, int] = {}
-            for cid in candidate_ids:
-                score = candidate_scores[cid]
+            for cid in all_candidate_ids:
+                score = hybrid_scores[cid]
                 if score <= 0.0:
                     continue
                 chunk = id_to_chunk.get(cid)
