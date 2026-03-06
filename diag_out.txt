@@ -1,0 +1,13 @@
+2026-03-03 19:58:46 [INFO] sentence_transformers.SentenceTransformer: Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+[ingestion] Vector search enabled — model: all-MiniLM-L6-v2 | device: cuda (NVIDIA GeForce RTX 5060 Laptop GPU)
+chunk_id: 8d606f01b047
+text[:200]: Latin name: Allium canadense mobilense. Family: Alliaceae. Common name: Canadian Garlic. Habit: Bulb. Height: 0.449999988. Width: 0.200000003. UK Hardiness: 4. Medicinal: The plant is antiasthmatic, c
+keyword_score: 0.5662
+in_kw_top15: True
+kw_score_in_pool: 0.5662
+top5 kw cands: [('2e9c80162d45', 0.5671912255603242), ('8d606f01b047', 0.5661767279090113), ('df50f05de98f', 0.5023130544993663), ('e12bb2d46ceb', 0.49873967840069533), ('201a50c83e83', 0.49861373660995584)]
+[ingestion] Loaded embedding cache: 7417 chunks from disk
+Batches:   0%|          | 0/1 [00:00<?, ?it/s]Batches: 100%|##########| 1/1 [00:00<00:00,  5.47it/s]Batches: 100%|##########| 1/1 [00:00<00:00,  5.47it/s]
+vector_score: 0.3659
+vector_rank: 160 / 7417
+top5 vector scores: [np.float32(0.45968354), np.float32(0.44869798), np.float32(0.4327948), np.float32(0.42890114), np.float32(0.4261632)]
