@@ -448,10 +448,42 @@ def _get_embedding_cache(store: "ChunkStore") -> Tuple[Any, List[str]]:
                     _emb_kb_dir = store.kb_dir
                     print(f"[ingestion] Loaded embedding cache: {len(ids)} chunks from disk")
                     return _emb_matrix, _emb_chunk_ids
+
+                # IDs file and matrix are out of sync — repair without re-encoding.
+                # Trust the matrix (it was written atomically by numpy.save); rebuild
+                # the IDs file from chunks.jsonl to match the matrix row count.
+                n_rows = matrix.shape[0]
+                all_chunks = store.load_all_chunks()
+                all_ids = [c["chunk_id"] for c in all_chunks]
+                if len(all_ids) >= n_rows:
+                    repaired_ids = all_ids[:n_rows]
+                    store.embedding_ids_file.write_text(
+                        "\n".join(repaired_ids), encoding="utf-8"
+                    )
+                    _emb_matrix = matrix
+                    _emb_chunk_ids = repaired_ids
+                    _emb_kb_dir = store.kb_dir
+                    print(
+                        f"[ingestion] Repaired embedding IDs file "
+                        f"({len(repaired_ids)} / {len(all_ids)} chunks) — no re-encode needed"
+                    )
+                    return _emb_matrix, _emb_chunk_ids
+                # Matrix has more rows than chunks on disk — stale; delete and fall
+                # through to cold rebuild (handled below with the size guard).
+                print(
+                    f"[ingestion] Embedding cache stale "
+                    f"(matrix={n_rows}, chunks={len(all_ids)}); will rebuild"
+                )
+                store.embeddings_file.unlink(missing_ok=True)
+                store.embedding_ids_file.unlink(missing_ok=True)
             except Exception as exc:
                 print(f"[ingestion] Embedding cache load failed ({exc}), rebuilding …")
 
-        # Cold start or corrupted: build from all chunks
+        # Cold start or corrupted: build from all chunks.
+        # Guard against OOM on large corpora — if the chunk count exceeds the
+        # threshold, skip vector search for this session rather than attempting
+        # to encode tens of thousands of chunks while the LLM is already loaded.
+        _COLD_REBUILD_LIMIT = 50_000
         chunks = store.load_all_chunks()
         if not chunks:
             _emb_matrix = _np.zeros((0, 384), dtype="float32")
@@ -459,12 +491,27 @@ def _get_embedding_cache(store: "ChunkStore") -> Tuple[Any, List[str]]:
             _emb_kb_dir = store.kb_dir
             return _emb_matrix, _emb_chunk_ids
 
+        if len(chunks) > _COLD_REBUILD_LIMIT:
+            print(
+                f"[ingestion] Corpus too large for cold rebuild "
+                f"({len(chunks)} chunks > {_COLD_REBUILD_LIMIT} limit); "
+                f"using keyword search this session. "
+                f"Re-import any document to rebuild the vector cache incrementally."
+            )
+            _emb_kb_dir = store.kb_dir   # mark dir so we don't retry every search
+            return None, []
+
         texts = [c["text"] for c in chunks]
         ids = [c["chunk_id"] for c in chunks]
         print(f"[ingestion] Building embedding cache for {len(chunks)} chunks …")
-        matrix = _EMBEDDING_MODEL.encode(
-            texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False
-        )
+        try:
+            matrix = _EMBEDDING_MODEL.encode(
+                texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False
+            )
+        except Exception as exc:  # includes CUDA OOM
+            print(f"[ingestion] Embedding encode failed ({exc}); using keyword search this session.")
+            _emb_kb_dir = store.kb_dir
+            return None, []
         _emb_matrix = _np.array(matrix, dtype="float32")
         _emb_chunk_ids = ids
         _emb_kb_dir = store.kb_dir
