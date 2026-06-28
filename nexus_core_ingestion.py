@@ -70,8 +70,8 @@ _emb_kb_dir: Optional[Path] = None        # tracks which kb_dir is cached
 # ---------------------------------------------------------------------------
 
 _SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".rst", ".log", ".csv", ".json"}
-# PDF / DOCX stubs — add parsers here when those deps are installed
-_SUPPORTED_ALL_EXTENSIONS = _SUPPORTED_TEXT_EXTENSIONS | {".pdf", ".docx"}
+# PDF / DOCX / HTML / EPUB stubs — add parsers here when those deps are installed
+_SUPPORTED_ALL_EXTENSIONS = _SUPPORTED_TEXT_EXTENSIONS | {".pdf", ".docx", ".html", ".htm", ".epub"}
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +153,10 @@ def read_file(file_path: Path) -> Optional[str]:
     Read a file and return its text content.
 
     Supports .txt, .md, .rst, .log, .csv, .json natively.
+    Supports .html/.htm via html.parser (stdlib — always available).
+    Supports .pdf via pdfplumber or PyPDF2 (install either).
+    Supports .docx via python-docx (install python-docx).
+    Supports .epub via ebooklib + html.parser (install ebooklib).
     Returns None for unsupported or unreadable files.
     """
     ext = file_path.suffix.lower()
@@ -180,6 +184,7 @@ def read_file(file_path: Path) -> Optional[str]:
                     page.extract_text() or "" for page in reader.pages
                 )
             except ImportError:
+                print("[ingestion] .pdf support requires pdfplumber or PyPDF2: pip install pdfplumber")
                 return None
 
         if ext == ".docx":
@@ -188,6 +193,73 @@ def read_file(file_path: Path) -> Optional[str]:
                 doc = docx.Document(str(file_path))
                 return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
             except ImportError:
+                print("[ingestion] .docx support requires python-docx: pip install python-docx")
+                return None
+
+        if ext in (".html", ".htm"):
+            from html.parser import HTMLParser
+
+            class _TextExtractor(HTMLParser):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self._parts: list[str] = []
+                    self._skip = False
+
+                def handle_starttag(self, tag: str, attrs: object) -> None:
+                    if tag in ("script", "style", "head"):
+                        self._skip = True
+
+                def handle_endtag(self, tag: str) -> None:
+                    if tag in ("script", "style", "head"):
+                        self._skip = False
+
+                def handle_data(self, data: str) -> None:
+                    if not self._skip:
+                        stripped = data.strip()
+                        if stripped:
+                            self._parts.append(stripped)
+
+            raw_html = file_path.read_text(encoding="utf-8", errors="replace")
+            parser = _TextExtractor()
+            parser.feed(raw_html)
+            return "\n".join(parser._parts) or None
+
+        if ext == ".epub":
+            try:
+                import ebooklib
+                from ebooklib import epub as _epub
+                from html.parser import HTMLParser
+
+                class _EpubTextExtractor(HTMLParser):
+                    def __init__(self) -> None:
+                        super().__init__()
+                        self._parts: list[str] = []
+                        self._skip = False
+
+                    def handle_starttag(self, tag: str, attrs: object) -> None:
+                        if tag in ("script", "style"):
+                            self._skip = True
+
+                    def handle_endtag(self, tag: str) -> None:
+                        if tag in ("script", "style"):
+                            self._skip = False
+
+                    def handle_data(self, data: str) -> None:
+                        if not self._skip:
+                            stripped = data.strip()
+                            if stripped:
+                                self._parts.append(stripped)
+
+                book = _epub.read_epub(str(file_path))
+                parts: list[str] = []
+                for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+                    content = item.get_content().decode("utf-8", errors="replace")
+                    p = _EpubTextExtractor()
+                    p.feed(content)
+                    parts.extend(p._parts)
+                return "\n".join(parts) or None
+            except ImportError:
+                print("[ingestion] .epub support requires ebooklib: pip install ebooklib")
                 return None
 
     except Exception as exc:
@@ -439,14 +511,18 @@ def _get_embedding_cache(store: "ChunkStore") -> Tuple[Any, List[str]]:
         # Try loading from persisted files
         if store.embeddings_file.exists() and store.embedding_ids_file.exists():
             try:
-                matrix = _np.load(str(store.embeddings_file))
+                # mmap_mode='r': the array lives on disk, OS pages it in/out as
+                # needed.  Python heap never allocates the full matrix — peak RAM
+                # per search is determined by the batch size in _batched_dot, not
+                # the total corpus size.
+                matrix = _np.load(str(store.embeddings_file), mmap_mode="r")
                 ids = store.embedding_ids_file.read_text(encoding="utf-8").splitlines()
                 ids = [i for i in ids if i]   # strip blank lines
                 if len(ids) == matrix.shape[0]:
                     _emb_matrix = matrix
                     _emb_chunk_ids = ids
                     _emb_kb_dir = store.kb_dir
-                    print(f"[ingestion] Loaded embedding cache: {len(ids)} chunks from disk")
+                    print(f"[ingestion] Loaded embedding cache: {len(ids)} chunks (mmap, not in RAM)")
                     return _emb_matrix, _emb_chunk_ids
 
                 # IDs file and matrix are out of sync — repair without re-encoding.
@@ -493,10 +569,10 @@ def _get_embedding_cache(store: "ChunkStore") -> Tuple[Any, List[str]]:
 
         if len(chunks) > _COLD_REBUILD_LIMIT:
             print(
-                f"[ingestion] Corpus too large for cold rebuild "
+                f"[ingestion] Corpus too large for in-request cold rebuild "
                 f"({len(chunks)} chunks > {_COLD_REBUILD_LIMIT} limit); "
                 f"using keyword search this session. "
-                f"Re-import any document to rebuild the vector cache incrementally."
+                f"Call rebuild_embedding_cache(data_dir) once to index the full corpus."
             )
             _emb_kb_dir = store.kb_dir   # mark dir so we don't retry every search
             return None, []
@@ -541,6 +617,29 @@ def _append_embedding_cache(
         )
         new_embs = _np.array(new_embs, dtype="float32")
 
+        # If the in-memory cache is cold or points at a different kb_dir, load
+        # the persisted matrix from disk before appending — otherwise we'd
+        # overwrite the full matrix with just the new file's chunks.
+        if _emb_matrix is None or _emb_kb_dir != store.kb_dir or _emb_matrix.shape[0] == 0:
+            if store.embeddings_file.exists() and store.embedding_ids_file.exists():
+                try:
+                    disk_matrix = _np.load(str(store.embeddings_file))
+                    disk_ids = [
+                        i for i in store.embedding_ids_file.read_text(
+                            encoding="utf-8"
+                        ).splitlines() if i
+                    ]
+                    if len(disk_ids) == disk_matrix.shape[0]:
+                        _emb_matrix = disk_matrix
+                        _emb_chunk_ids = disk_ids
+                        _emb_kb_dir = store.kb_dir
+                except Exception:
+                    pass  # fall through to replace-mode below
+
+        # Note: the disk_matrix loaded above (if any) is a plain ndarray copy
+        # since mmap of a file we're about to overwrite would be unsafe during
+        # the vstack+save below.  After saving we re-open the new file as mmap.
+
         if _emb_matrix is None or _emb_kb_dir != store.kb_dir or _emb_matrix.shape[0] == 0:
             _emb_matrix = new_embs
             _emb_chunk_ids = list(chunk_ids)
@@ -549,13 +648,130 @@ def _append_embedding_cache(
             _emb_chunk_ids.extend(chunk_ids)
         _emb_kb_dir = store.kb_dir
 
-        # Persist updated matrix and id list
+        # Persist updated matrix and id list, then swap to mmap reference so
+        # the full array is released from Python heap.
         _np.save(str(store.embeddings_file), _emb_matrix)
         with store.embedding_ids_file.open("a", encoding="utf-8") as fh:
             fh.write("\n".join(chunk_ids) + "\n")
+        try:
+            _emb_matrix = _np.load(str(store.embeddings_file), mmap_mode="r")
+        except Exception:
+            pass  # keep the in-RAM copy if mmap re-open fails
 
 
-def _vector_score(query: str, chunks: List[Dict[str, Any]]) -> List[float]:
+def _batched_dot(
+    matrix: Any,
+    q_vec: Any,
+    fetch_k: int,
+    batch_size: int = 10_000,
+) -> Tuple[Any, Any]:
+    """Score every row in *matrix* against *q_vec* using sequential batches.
+
+    This bounds peak RAM regardless of corpus size:
+    - `matrix` should be a memory-mapped numpy array (``mmap_mode='r'``).
+    - Only ``batch_size`` rows are paged into physical memory at a time
+      (~15 MB for batch_size=10_000, dim=384).
+    - The returned ``scores`` array is only ``n × 4`` bytes (400 KB for 100k
+      chunks, 4 MB for 1M chunks) — not proportional to the matrix.
+
+    Returns
+    -------
+    top_idx : ndarray, shape (fetch_k,)
+        Row indices of the top-fetch_k highest-scoring rows, sorted descending.
+    scores : ndarray, shape (n,)
+        Full score vector (needed for hybrid re-ranking of keyword candidates).
+    """
+    n = matrix.shape[0]
+    scores = _np.empty(n, dtype="float32")
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        scores[start:end] = matrix[start:end] @ q_vec   # pages in one slice
+
+    actual_fetch = min(fetch_k, n)
+    top_idx = _np.argpartition(scores, -actual_fetch)[-actual_fetch:]
+    top_idx = top_idx[_np.argsort(scores[top_idx])[::-1]]
+    return top_idx, scores
+
+
+def rebuild_embedding_cache(
+    data_dir: Optional[str | Path] = None,
+    batch_size: int = 64,
+) -> int:
+    """Re-index any chunks in the knowledge base that are not yet embedded.
+
+    Safe to call at any time — it only encodes chunks whose IDs are absent
+    from the current embedding matrix.  Already-indexed chunks are skipped.
+    Run this once after a bulk ingest to bring the vector cache up to date.
+
+    Returns the number of newly embedded chunks.
+    """
+    if not _VECTOR_SEARCH_AVAILABLE or _np is None:
+        print("[ingestion] rebuild_embedding_cache: sentence-transformers not available.")
+        return 0
+
+    if data_dir is None:
+        data_dir = _config.nexus_data_path
+    kb_dir = Path(data_dir) / "knowledge_base"
+    store = ChunkStore(kb_dir)
+
+    global _emb_matrix, _emb_chunk_ids, _emb_kb_dir
+
+    all_chunks = store.load_all_chunks()
+    if not all_chunks:
+        print("[ingestion] rebuild_embedding_cache: no chunks found.")
+        return 0
+
+    # Load the current persisted set of embedded IDs (not the in-memory cache)
+    existing_ids: set[str] = set()
+    if store.embedding_ids_file.exists():
+        existing_ids = set(
+            i for i in store.embedding_ids_file.read_text(encoding="utf-8").splitlines() if i
+        )
+
+    missing = [c for c in all_chunks if c["chunk_id"] not in existing_ids]
+    if not missing:
+        print(f"[ingestion] rebuild_embedding_cache: all {len(all_chunks)} chunks already indexed.")
+        return 0
+
+    print(f"[ingestion] rebuild_embedding_cache: encoding {len(missing)} missing chunks "
+          f"(out of {len(all_chunks)} total) …")
+
+    # Encode in batches so progress is visible and GPU memory peaks are bounded
+    total_encoded = 0
+    REPORT_EVERY = 5_000
+    batch_ids: list[str] = []
+    batch_texts: list[str] = []
+
+    def _flush() -> None:
+        nonlocal total_encoded
+        if not batch_ids:
+            return
+        _append_embedding_cache(store, chunk_ids=batch_ids, texts=batch_texts)
+        total_encoded += len(batch_ids)
+        batch_ids.clear()
+        batch_texts.clear()
+
+    for chunk in missing:
+        batch_ids.append(chunk["chunk_id"])
+        batch_texts.append(chunk["text"])
+        if len(batch_ids) >= batch_size * 8:   # flush every ~512 chunks
+            _flush()
+            if total_encoded % REPORT_EVERY < batch_size * 8:
+                print(f"[ingestion] rebuild_embedding_cache: {total_encoded}/{len(missing)} …")
+
+    _flush()   # flush remainder
+
+    # Invalidate the in-memory cache so the next search reloads from disk
+    with _emb_lock:
+        _emb_matrix = None
+        _emb_chunk_ids = []
+        _emb_kb_dir = None
+
+    print(f"[ingestion] rebuild_embedding_cache: done — {total_encoded} new chunks indexed, "
+          f"{len(all_chunks)} total in corpus.")
+    return total_encoded
+
+
     """Vector cosine similarity scores (requires sentence-transformers).
     Kept for backward compatibility with search_chunks(); not used by the
     optimised search_knowledge_base() path.
@@ -765,13 +981,10 @@ def search_knowledge_base(
             )
             q_vec = _np.array(q_emb[0], dtype="float32")
 
-            # Dot product against the full matrix: shape (n,)
-            scores = matrix @ q_vec
-
-            # Pick top_k * 3 vector candidates
+            # Batched dot product — processes matrix in 10k-row slices so
+            # peak RAM is ~15 MB regardless of total corpus size.
             fetch_k = min(top_k * 3, len(cache_ids))
-            top_idx = _np.argpartition(scores, -fetch_k)[-fetch_k:]
-            top_idx = top_idx[_np.argsort(scores[top_idx])[::-1]]
+            top_idx, scores = _batched_dot(matrix, q_vec, fetch_k)
 
             vec_scores: Dict[str, float] = {cache_ids[i]: float(scores[i]) for i in top_idx}
 
